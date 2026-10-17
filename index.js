@@ -8,7 +8,7 @@
  * 彻底捕获所有发往大模型或嵌入向量服务的请求，并基于调用栈（Call Stack）进行插件精确归因。
  * 
  * @author ymf2317-tech
- * @version 1.0.0
+ * @version 1.1.0
  */
 
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -19,7 +19,7 @@ const EXTENSION_NAME = 'st-omni-api-tracker';
 // 默认存储结构
 const defaultSettings = {
     enabled: true,
-    showInTopBar: true,
+    showInTopBar: true, // 控制顶栏闪电徽章显示/隐藏
     totals: {
         prompt_tokens: 0,
         completion_tokens: 0,
@@ -41,10 +41,10 @@ const defaultSettings = {
         requests: 0,
     },
     byCategory: {
-        chat: { label: '正文主聊', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#3b82f6' },
-        memory: { label: '记忆/总结', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#ec4899' },
+        chat: { label: '正文主聊', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#38bdf8' },
+        memory: { label: '记忆/总结/SP数据库', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#ec4899' },
+        preset_tools: { label: '预设/小白盒工具', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#f59e0b' },
         vectors: { label: '向量检索', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#10b981' },
-        preset_tools: { label: '预设/小白盒/工具', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#f59e0b' },
         other: { label: '其他扩展', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#8b5cf6' },
     },
     byModel: {},
@@ -139,32 +139,54 @@ function isTargetLLMApi(url) {
 }
 
 /**
- * 基于调用栈与载荷的精准归因识别器
+ * 智能归因识别器（核心重构）
+ * 准确区分：经由小白盒拦截的正文主聊 vs 小白盒自身后台意图/总结 vs 记忆脚本(SP数据库/Smart-Context) vs 纯其他扩展
  */
-function classifyRequest(stack, url, requestBody) {
+function classifyRequest(stack, url, reqBodyParsed, isStream) {
     const s = (stack || '').toLowerCase();
     const u = (url || '').toLowerCase();
 
-    // 1. 向量 / 嵌入
-    if (u.includes('/embeddings') || s.includes('vectors') || s.includes('embedding')) {
+    // 1. 向量嵌入检索
+    if (u.includes('/embeddings') || s.includes('vectors') || s.includes('chroma') || s.includes('embedding')) {
         return { category: 'vectors', caller: 'Vectors/Embedding' };
     }
 
-    // 2. 记忆与总结插件
-    if (s.includes('smart-context')) {
-        return { category: 'memory', caller: 'Smart-Context' };
-    }
-    if (s.includes('extensions/memory') || s.includes('/memory/')) {
-        return { category: 'memory', caller: 'ST Memory' };
-    }
-    if (s.includes('summarize') || (requestBody && typeof requestBody === 'string' && requestBody.includes('Summarize the previous'))) {
-        return { category: 'memory', caller: 'Auto-Summary' };
+    // 2. 记忆与长程数据库类（包含 SP 数据库、酒馆助手、Smart Context、酒馆原生 Memory、Auto-Summary）
+    const isMemoryRelated = s.includes('smart-context') ||
+        s.includes('extensions/memory') ||
+        s.includes('/memory/') ||
+        s.includes('supermemory') ||
+        s.includes('sp_database') ||
+        s.includes('sp-database') ||
+        s.includes('database') ||
+        s.includes('sqlite') ||
+        s.includes('assistant') ||
+        s.includes('summarize');
+
+    if (isMemoryRelated) {
+        let caller = 'Memory/Summary';
+        if (s.includes('smart-context')) caller = 'Smart-Context';
+        else if (s.includes('sp') || s.includes('database')) caller = 'SP数据库/记忆库';
+        else if (s.includes('extensions/memory')) caller = 'ST原生记忆';
+        return { category: 'memory', caller };
     }
 
-    // 3. 预设、工具、小白盒
+    // 3. 小白盒（LittlewhiteBox）精细化判定：
+    // 如果堆栈来自小白盒拦截器，但请求体具备完整的对话上下文，且为流式生成，这本质上是“经小白盒代理的正文主聊”！
     if (s.includes('littlewhitebox') || s.includes('xiaobai')) {
-        return { category: 'preset_tools', caller: 'LittleWhiteBox' };
+        const messages = reqBodyParsed?.messages;
+        const isMultiTurn = Array.isArray(messages) && messages.length > 1;
+
+        // 如果是流式且多轮对话，或者在聊天队列中，归为“正文主聊”
+        if (isStream || isMultiTurn) {
+            return { category: 'chat', caller: '小白盒 (正文主聊)' };
+        } else {
+            // 只有单句探测、意图识别、独立小指令才算预设工具
+            return { category: 'preset_tools', caller: '小白盒 (意图/工具)' };
+        }
     }
+
+    // 4. 其他预设、模板、命令扩展
     if (s.includes('st-prompt-template')) {
         return { category: 'preset_tools', caller: 'Prompt-Template' };
     }
@@ -178,18 +200,23 @@ function classifyRequest(stack, url, requestBody) {
         return { category: 'preset_tools', caller: 'Caption' };
     }
 
-    // 4. 正文主流程
+    // 5. 正文主流程（script.js 核心）
     if (s.includes('script.js') || s.includes('sendgenerationrequest') || s.includes('getchatcompletion')) {
         return { category: 'chat', caller: '主聊正文' };
     }
 
-    // 5. 抓取第三方插件目录名
+    // 6. 提取第三方未知名扩展目录
     const match = s.match(/extensions\/third-party\/([a-zA-Z0-9_-]+)/i);
     if (match && match[1]) {
         return { category: 'other', caller: match[1] };
     }
 
-    return { category: 'chat', caller: '主聊生成' };
+    // 兜底：如果是流式多轮，默认主聊；否则归其他
+    if (isStream) {
+        return { category: 'chat', caller: '主聊管道' };
+    }
+
+    return { category: 'other', caller: '外部/其他扩展' };
 }
 
 /**
@@ -302,17 +329,12 @@ function installFetchHook() {
         const startTime = performance.now();
 
         try {
-            // 1. 抓取堆栈回溯，精准归因
-            const stack = (new Error()).stack || '';
+            // 解析请求体
+            let parsedReq = null;
             const reqBody = options.body;
-            const classification = classifyRequest(stack, trackerItem.url, reqBody);
-            trackerItem.category = classification.category;
-            trackerItem.caller = classification.caller;
-
-            // 2. 解析请求体
             if (reqBody && typeof reqBody === 'string') {
                 try {
-                    const parsedReq = JSON.parse(reqBody);
+                    parsedReq = JSON.parse(reqBody);
                     trackerItem.model = parsedReq.model || trackerItem.model;
                     trackerItem.is_stream = !!parsedReq.stream;
 
@@ -328,6 +350,12 @@ function installFetchHook() {
                     }
                 } catch (_) {}
             }
+
+            // 抓取堆栈回溯，精准归因识别
+            const stack = (new Error()).stack || '';
+            const classification = classifyRequest(stack, trackerItem.url, parsedReq, trackerItem.is_stream);
+            trackerItem.category = classification.category;
+            trackerItem.caller = classification.caller;
         } catch (prepErr) {
             console.warn('[OmniTracker] Trace error (ignorable):', prepErr);
         }
@@ -335,16 +363,15 @@ function installFetchHook() {
         // 触发顶栏微动效提示
         triggerTopBarPulse();
 
-        // 3. 执行真实网络请求
+        // 执行真实网络请求
         let response;
         try {
             response = await originalFetch.apply(this, args);
         } catch (fetchErr) {
-            // 网络异常直接抛出，不阻断宿主
             throw fetchErr;
         }
 
-        // 4. 分析响应
+        // 分析响应
         try {
             if (response && response.ok) {
                 // 流式响应 (SSE)：利用 body.tee() 进行无损旁路镜像
@@ -385,7 +412,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 全局底层网络拦截器挂载成功 (loading_order: 1)');
+    console.log('[OmniTracker] 全局底层网络拦截器已就绪 (v1.1.0, loading_order: 1)');
 }
 
 /**
@@ -415,7 +442,6 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 
                 try {
                     const parsed = JSON.parse(dataStr);
-                    // 检查各大中转站/官方的 usage 字段
                     if (parsed.usage) {
                         officialUsage = parsed.usage;
                     }
@@ -427,7 +453,6 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
             }
         }
     } catch (e) {
-        // 读取取消或被 AbortController 中断
     } finally {
         trackerItem.duration_ms = Math.round(performance.now() - startTime);
 
@@ -443,7 +468,7 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 }
 
 /**
- * 挂载 UI 元素（包含自愈重试）
+ * 挂载 UI 元素（包含自愈重试与顶栏开关检查）
  */
 function tryMountUI() {
     if (!window.$) {
@@ -451,29 +476,30 @@ function tryMountUI() {
         return;
     }
 
-    // 1. 挂载顶栏指示器
-    if ($('#omni_tracker_topbar_btn').length === 0) {
-        const btnHtml = `
-            <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击查看全量调用看板">
-                <i class="fa-solid fa-bolt"></i>
-                <span id="omni_tracker_topbar_text">0</span>
-            </div>
-        `;
+    // 1. 顶栏指示器（根据 showInTopBar 开关决定是否挂载）
+    if (settings && settings.showInTopBar) {
+        if ($('#omni_tracker_topbar_btn').length === 0) {
+            const btnHtml = `
+                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击查看全量调用看板">
+                    <i class="fa-solid fa-bolt"></i>
+                    <span id="omni_tracker_topbar_text">0</span>
+                </div>
+            `;
 
-        if ($('#top-bar').length) {
-            $('#top-bar').append(btnHtml);
-            $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
-        } else if ($('#chat_header').length) {
-            $('#chat_header').append(btnHtml);
-            $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
-        } else {
-            // UI 还没好，稍后重试
-            setTimeout(tryMountUI, 500);
-            return;
+            if ($('#top-bar').length) {
+                $('#top-bar').append(btnHtml);
+                $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
+            } else if ($('#chat_header').length) {
+                $('#chat_header').append(btnHtml);
+                $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
+            }
         }
+    } else {
+        // 如果用户关闭了开关，彻底移除顶栏元素
+        $('#omni_tracker_topbar_btn').remove();
     }
 
-    // 2. 挂载设置面板抽屉
+    // 2. 挂载设置面板抽屉（即使顶栏关闭，这里也永远提供打开入口）
     mountExtensionSettingsDrawer();
     updateTopBarUI();
 }
@@ -488,11 +514,11 @@ function mountExtensionSettingsDrawer() {
                     <b><i class="fa-solid fa-bolt" style="color:#4ade80;"></i> Omni API 全量调用审计</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
-                <div class="inline-drawer-content" style="padding: 10px;">
-                    <p style="font-size:12px; color:#aaa; margin-bottom: 8px;">
-                        全量监听正文主聊、记忆插件（Smart Context / Memory）、小白盒意图与脚本、预设模板及向量嵌入等全部 API 用量。
+                <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px;">
+                    <p style="font-size:12px; color:#cbd5e1; margin-bottom: 10px; line-height: 1.5;">
+                        底层透明监听：正文主聊、记忆插件（SP数据库/Smart-Context/Memory）、小白盒意图与工具、向量检索等全部 API 消耗。
                     </p>
-                    <div style="display:flex; gap:8px;">
+                    <div style="display:flex; gap:10px;">
                         <button class="menu_button" id="omni_open_dashboard_from_settings">
                             <i class="fa-solid fa-chart-pie"></i> 打开审计看板
                         </button>
@@ -508,8 +534,10 @@ function mountExtensionSettingsDrawer() {
 function triggerTopBarPulse() {
     if (!window.$) return;
     const $btn = $('#omni_tracker_topbar_btn');
-    $btn.addClass('pulse-active');
-    setTimeout(() => $btn.removeClass('pulse-active'), 800);
+    if ($btn.length) {
+        $btn.addClass('pulse-active');
+        setTimeout(() => $btn.removeClass('pulse-active'), 800);
+    }
 }
 
 function updateTopBarUI() {
@@ -529,8 +557,8 @@ function showDashboardModal() {
         <div id="omni_tracker_modal" class="omni-modal-overlay">
             <div class="omni-modal-content">
                 <div class="omni-modal-header">
-                    <h3><i class="fa-solid fa-chart-pie" style="color:#4ade80;"></i> Omni API 全量调用审计看板</h3>
-                    <button class="omni-close-btn" id="omni_close_modal_btn"><i class="fa-solid fa-xmark"></i></button>
+                    <h3><i class="fa-solid fa-chart-pie" style="color:#34d399;"></i> Omni API 全量调用审计看板</h3>
+                    <button class="omni-close-btn" id="omni_close_modal_btn" title="关闭看板"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="omni-tabs">
                     <button class="omni-tab-btn active" data-tab="overview">📊 用量概览</button>
@@ -579,20 +607,36 @@ function renderDashboardUI(activeTab) {
         // 计算分类百分比
         const catTotal = Math.max(1, Object.values(settings.byCategory).reduce((acc, c) => acc + (c.total_tokens || 0), 0));
 
-        let catBarsHtml = '';
+        let activeCatsHtml = '';
+        let zeroCatsHtml = '';
+
         for (const [key, cat] of Object.entries(settings.byCategory)) {
-            const pct = ((cat.total_tokens / catTotal) * 100).toFixed(1);
-            catBarsHtml += `
-                <div class="omni-category-row">
+            const hasUsage = (cat.requests > 0 || cat.total_tokens > 0);
+            const pct = hasUsage ? ((cat.total_tokens / catTotal) * 100).toFixed(1) : '0.0';
+
+            const cardHtml = `
+                <div class="omni-category-card ${hasUsage ? '' : 'is-zero'}">
                     <div class="omni-category-info">
-                        <span><strong>${cat.label}</strong> (${cat.requests}次调用)</span>
-                        <span>${formatTokens(cat.total_tokens)} (${pct}%)</span>
+                        <div class="omni-category-name">
+                            <span>${cat.label}</span>
+                            <span class="omni-category-calls">(${cat.requests}次调用)</span>
+                        </div>
+                        <div class="omni-category-stats">
+                            <span>${formatTokens(cat.total_tokens)}</span>
+                            <span class="omni-category-pct">(${pct}%)</span>
+                        </div>
                     </div>
                     <div class="omni-progress-bg">
-                        <div class="omni-progress-bar" style="width: ${pct}%; background: ${cat.color};"></div>
+                        <div class="omni-progress-bar" style="width: ${hasUsage ? pct : 0}%; background: ${cat.color};"></div>
                     </div>
                 </div>
             `;
+
+            if (hasUsage) {
+                activeCatsHtml += cardHtml;
+            } else {
+                zeroCatsHtml += cardHtml;
+            }
         }
 
         $panel.html(`
@@ -604,42 +648,49 @@ function renderDashboardUI(activeTab) {
                 </div>
                 <div class="omni-stat-card">
                     <div class="omni-stat-title">本次会话</div>
-                    <div class="omni-stat-value" style="color:#60a5fa;">${formatTokens(session.total_tokens)}</div>
+                    <div class="omni-stat-value" style="color:#60a5fa !important;">${formatTokens(session.total_tokens)}</div>
                     <div class="omni-stat-sub">${session.requests} 次 API 调用</div>
                 </div>
                 <div class="omni-stat-card">
                     <div class="omni-stat-title">历史累计调用</div>
-                    <div class="omni-stat-value" style="color:#c084fc;">${formatTokens(total.total_tokens)}</div>
+                    <div class="omni-stat-value" style="color:#c084fc !important;">${formatTokens(total.total_tokens)}</div>
                     <div class="omni-stat-sub">共 ${total.requests} 次交互</div>
                 </div>
             </div>
 
-            <div class="omni-section-title"><i class="fa-solid fa-layer-group"></i> 模块用量分类（正文 vs 记忆 vs 预设工具）</div>
-            <div style="background: rgba(0,0,0,0.15); padding: 12px; border-radius: 8px; border: 1px solid var(--SmartThemeBorderColor, #333);">
-                ${catBarsHtml}
+            <div class="omni-section-title"><i class="fa-solid fa-layer-group" style="color:#38bdf8;"></i> 产生消耗的模块</div>
+            <div>
+                ${activeCatsHtml || '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">暂无活跃模块消耗记录</div>'}
             </div>
+
+            ${zeroCatsHtml ? `
+                <div class="omni-section-title" style="margin-top:22px; font-size:12px; color:#94a3b8 !important;">
+                    <i class="fa-solid fa-minus"></i> 未产生调用的模块 (未开启或无请求)
+                </div>
+                <div>${zeroCatsHtml}</div>
+            ` : ''}
         `);
     } else if (activeTab === 'logs') {
         const logs = settings.recentLogs || [];
         if (logs.length === 0) {
-            $panel.html('<div style="text-align:center; padding: 40px; color:#888;">暂无调用记录，与酒馆对话或触发记忆插件后将实时显示。</div>');
+            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、或触发记忆/小白盒后台脚本时将在此实时显示。</div>');
             return;
         }
 
         let rowsHtml = '';
         for (const log of logs) {
             const badgeClass = `omni-badge-${log.category || 'other'}`;
-            const catLabel = settings.byCategory[log.category]?.label || log.category;
+            const catLabel = settings.byCategory[log.category]?.label?.split('/')[0] || log.category;
             rowsHtml += `
                 <tr>
-                    <td>${log.time}</td>
+                    <td style="color:#94a3b8;">${log.time}</td>
                     <td><span class="omni-badge ${badgeClass}">${catLabel}</span></td>
-                    <td style="color:#bbb; max-width:140px; overflow:hidden; text-overflow:ellipsis;">${log.caller || '-'}</td>
-                    <td style="color:#60a5fa;">${log.model || '-'}</td>
+                    <td style="color:#f8fafc; font-weight:600; max-width:140px; overflow:hidden; text-overflow:ellipsis;">${log.caller || '-'}</td>
+                    <td style="color:#38bdf8;">${log.model || '-'}</td>
                     <td>${formatTokens(log.prompt_tokens)}</td>
                     <td>${formatTokens(log.completion_tokens)}</td>
-                    <td style="font-weight:700;">${formatTokens(log.total_tokens)}</td>
-                    <td style="color:#888;">${log.duration_ms ? log.duration_ms + 'ms' : '-'}</td>
+                    <td style="font-weight:700; color:#34d399;">${formatTokens(log.total_tokens)}</td>
+                    <td style="color:#94a3b8;">${log.duration_ms ? log.duration_ms + 'ms' : '-'}</td>
                 </tr>
             `;
         }
@@ -650,7 +701,7 @@ function renderDashboardUI(activeTab) {
                     <thead>
                         <tr>
                             <th>时间</th>
-                            <th>归属类别</th>
+                            <th>归属</th>
                             <th>发起来源</th>
                             <th>模型</th>
                             <th>Prompt</th>
@@ -669,7 +720,7 @@ function renderDashboardUI(activeTab) {
         const models = settings.byModel || {};
         const mKeys = Object.keys(models);
         if (mKeys.length === 0) {
-            $panel.html('<div style="text-align:center; padding: 40px; color:#888;">暂无模型调用数据。</div>');
+            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无模型调用数据。</div>');
             return;
         }
 
@@ -678,11 +729,11 @@ function renderDashboardUI(activeTab) {
             const data = models[m];
             rows += `
                 <tr>
-                    <td style="font-weight:700; color:#60a5fa;">${m}</td>
+                    <td style="font-weight:700; color:#38bdf8;">${m}</td>
                     <td>${data.requests} 次</td>
                     <td>${formatTokens(data.prompt_tokens)}</td>
                     <td>${formatTokens(data.completion_tokens)}</td>
-                    <td style="font-weight:700; color:#4ade80;">${formatTokens(data.total_tokens)}</td>
+                    <td style="font-weight:700; color:#34d399;">${formatTokens(data.total_tokens)}</td>
                 </tr>
             `;
         }
@@ -706,17 +757,40 @@ function renderDashboardUI(activeTab) {
     } else if (activeTab === 'settings') {
         $panel.html(`
             <div style="font-size: 13px; line-height: 1.8;">
-                <p><strong>Omni API Tracker v1.0.0</strong> - SillyTavern 全域调用透明审计</p>
-                <p style="color:#aaa;">本插件直接监听浏览器底层网络接口，具备流式管道旁路镜像（Tee）技术，所有发往酒馆后端或外部 API 的正文生成、记忆检索、长程记忆总结、小白盒意图判断与脚本调用均可精准归类记录。</p>
-                
-                <div class="omni-actions" style="margin-top:20px; justify-content:flex-start; flex-wrap:wrap;">
+                <div class="omni-setting-row">
+                    <div>
+                        <div class="omni-setting-label">显示顶栏快捷指示器</div>
+                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 今日消耗徽章（关闭后顶部更清爽，可随时从侧边栏扩展列表打开看板）</div>
+                    </div>
+                    <label class="omni-switch">
+                        <input type="checkbox" id="omni_toggle_topbar" ${settings.showInTopBar ? 'checked' : ''}>
+                        <span class="omni-slider"></span>
+                    </label>
+                </div>
+
+                <div class="omni-actions" style="margin-top:24px;">
                     <button class="menu_button" id="omni_btn_reset_session"><i class="fa-solid fa-arrows-rotate"></i> 重置本次会话</button>
                     <button class="menu_button" id="omni_btn_reset_today"><i class="fa-solid fa-calendar-xmark"></i> 清空今日统计</button>
                     <button class="menu_button" id="omni_btn_export_json"><i class="fa-solid fa-file-export"></i> 导出审计记录 (JSON)</button>
-                    <button class="menu_button" id="omni_btn_clear_all" style="background:#7f1d1d; color:#fca5a5;"><i class="fa-solid fa-trash"></i> 清空全部历史数据</button>
+                    <button class="menu_button" id="omni_btn_clear_all" style="background:#7f1d1d !important; color:#fca5a5 !important;"><i class="fa-solid fa-trash"></i> 清空全部历史数据</button>
                 </div>
             </div>
         `);
+
+        // 顶栏开关事件
+        $('#omni_toggle_topbar').on('change', function () {
+            const isChecked = $(this).prop('checked');
+            settings.showInTopBar = isChecked;
+            safeSaveSettings();
+
+            if (isChecked) {
+                tryMountUI();
+                if (window.toastr) toastr.success('已开启顶栏指示器');
+            } else {
+                $('#omni_tracker_topbar_btn').remove();
+                if (window.toastr) toastr.info('已隐藏顶栏指示器（可随时从扩展抽屉打开看板）');
+            }
+        });
 
         $('#omni_btn_reset_session').on('click', () => {
             settings.session = { startTime: Date.now(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 };
