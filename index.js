@@ -1,6 +1,6 @@
 /**
  * Omni API Tracker for SillyTavern
- * 全量 API 调用审计与统计插件（正文 + 记忆插件 + 预设工具 + 向量检索 100% 全量捕获）
+ * 全量 API 调用审计与统计插件（正文 + 记忆/SP数据库 + 小白盒工具 + TTS语音 + 向量检索 100% 全量捕获）
  * 
  * 核心原理：
  * 采用全局底层网络请求代理（Global Fetch Interceptor）与流管道旁路镜像（ReadableStream.tee()），
@@ -8,7 +8,7 @@
  * 彻底捕获所有发往大模型或嵌入向量服务的请求，并基于调用栈（Call Stack）进行插件精确归因。
  * 
  * @author ymf2317-tech
- * @version 1.1.0
+ * @version 1.2.0
  */
 
 import { saveSettingsDebounced } from '../../../../script.js';
@@ -42,8 +42,9 @@ const defaultSettings = {
     },
     byCategory: {
         chat: { label: '正文主聊', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#38bdf8' },
-        memory: { label: '记忆/总结/SP数据库', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#ec4899' },
-        preset_tools: { label: '预设/小白盒工具', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#f59e0b' },
+        memory: { label: '记忆/总结/SP', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#ec4899' },
+        tts: { label: '语音朗读(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' },
+        preset_tools: { label: '预设/工具/脚本', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#f59e0b' },
         vectors: { label: '向量检索', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#10b981' },
         other: { label: '其他扩展', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#8b5cf6' },
     },
@@ -68,6 +69,11 @@ function loadSettings() {
         if (settings[key] === undefined) {
             settings[key] = JSON.parse(JSON.stringify(defaultSettings[key]));
         }
+    }
+
+    // 确保有 tts 分类
+    if (!settings.byCategory.tts) {
+        settings.byCategory.tts = { label: '语音朗读(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' };
     }
 
     // 检查日期跨天
@@ -100,17 +106,24 @@ function formatTokens(num) {
 }
 
 /**
- * 启发式通用 Token 估算器（中英文混合自适应）
+ * 现代大模型高精度分词估算器（对齐 BPE / cl100k / deepseek 分词器）
  */
 function estimateTokens(text) {
     if (!text || typeof text !== 'string') return 0;
-    const chineseChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+    // 中文字符（含中文标点）
+    const chineseChars = (text.match(/[\u4e00-\u9fa5\u3000-\u303f\uff01-\uff5e]/g) || []).length;
+    // 英文单词与字符
     const otherChars = text.length - chineseChars;
-    return Math.max(1, Math.round(chineseChars * 0.95 + (otherChars / 3.8)));
+    // 换行符与格式标记单独加权
+    const newlines = (text.match(/\n/g) || []).length;
+
+    // 中文平均 1 字 ≈ 1.05 token；英文与符号按 3.2 字符 ≈ 1 token
+    const estimated = Math.round(chineseChars * 1.05 + (otherChars / 3.2) + (newlines * 0.5));
+    return Math.max(1, estimated);
 }
 
 /**
- * 识别 API 目标
+ * 识别大模型与 TTS API 目标
  */
 function isTargetLLMApi(url) {
     if (!url) return false;
@@ -124,14 +137,18 @@ function isTargetLLMApi(url) {
     // 酒馆后端代理端点
     if (urlStr.includes('/api/backends/chat-completions') ||
         urlStr.includes('/api/backends/text-completions') ||
-        urlStr.includes('/api/backends/embeddings')) {
+        urlStr.includes('/api/backends/embeddings') ||
+        urlStr.includes('/api/backends/tts') ||
+        urlStr.includes('/api/plugins/')) {
         return true;
     }
 
-    // 直连 OpenAI 格式端点
+    // 直连 OpenAI 格式端点或 TTS 端点
     if (urlStr.includes('/v1/chat/completions') ||
         urlStr.includes('/v1/completions') ||
-        urlStr.includes('/v1/embeddings')) {
+        urlStr.includes('/v1/embeddings') ||
+        urlStr.includes('/v1/audio/speech') ||
+        urlStr.includes('/audio/speech')) {
         return true;
     }
 
@@ -139,84 +156,92 @@ function isTargetLLMApi(url) {
 }
 
 /**
- * 智能归因识别器（核心重构）
- * 准确区分：经由小白盒拦截的正文主聊 vs 小白盒自身后台意图/总结 vs 记忆脚本(SP数据库/Smart-Context) vs 纯其他扩展
+ * 核心多维归因识别器（重构优先级，杜绝误判）
+ * 优先级：TTS 语音 > 向量嵌入 > 记忆/SP数据库 > 正文主聊 > 预设/工具 > 其他
  */
-function classifyRequest(stack, url, reqBodyParsed, isStream) {
+function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
     const s = (stack || '').toLowerCase();
     const u = (url || '').toLowerCase();
+    const m = (modelName || '').toLowerCase();
 
-    // 1. 向量嵌入检索
-    if (u.includes('/embeddings') || s.includes('vectors') || s.includes('chroma') || s.includes('embedding')) {
-        return { category: 'vectors', caller: 'Vectors/Embedding' };
+    // 1. 优先判定：TTS / 语音朗读（独立分类）
+    const isTTS = m.includes('tts') ||
+        m.includes('mimo') ||
+        m.includes('voice') ||
+        m.includes('speech') ||
+        u.includes('/audio/') ||
+        u.includes('/tts') ||
+        s.includes('tts') ||
+        s.includes('mimo');
+
+    if (isTTS) {
+        let caller = 'TTS语音';
+        if (m.includes('mimo') || s.includes('mimo')) caller = 'MiMo-TTS';
+        else if (m.includes('edge')) caller = 'Edge-TTS';
+        return { category: 'tts', caller };
     }
 
-    // 2. 记忆与长程数据库类（包含 SP 数据库、酒馆助手、Smart Context、酒馆原生 Memory、Auto-Summary）
+    // 2. 向量嵌入检索
+    if (u.includes('/embeddings') || m.includes('embed') || s.includes('vectors') || s.includes('chroma')) {
+        return { category: 'vectors', caller: '向量检索' };
+    }
+
+    // 3. 记忆与长程数据库类（包含 SP 数据库、酒馆助手、Smart Context、ST原生记忆、总结）
     const isMemoryRelated = s.includes('smart-context') ||
         s.includes('extensions/memory') ||
         s.includes('/memory/') ||
-        s.includes('supermemory') ||
         s.includes('sp_database') ||
         s.includes('sp-database') ||
         s.includes('database') ||
         s.includes('sqlite') ||
         s.includes('assistant') ||
+        s.includes('supermemory') ||
         s.includes('summarize');
 
     if (isMemoryRelated) {
-        let caller = 'Memory/Summary';
-        if (s.includes('smart-context')) caller = 'Smart-Context';
-        else if (s.includes('sp') || s.includes('database')) caller = 'SP数据库/记忆库';
+        let caller = '记忆/总结';
+        if (s.includes('sp') || s.includes('database')) caller = 'SP数据库/助手';
+        else if (s.includes('smart-context')) caller = 'Smart-Context';
         else if (s.includes('extensions/memory')) caller = 'ST原生记忆';
         return { category: 'memory', caller };
     }
 
-    // 3. 小白盒（LittlewhiteBox）精细化判定：
-    // 如果堆栈来自小白盒拦截器，但请求体具备完整的对话上下文，且为流式生成，这本质上是“经小白盒代理的正文主聊”！
+    // 4. 正文主聊判定（长上下文、多轮对话或流式生成，无论外面被谁包装，其本质就是主聊）
+    const messages = reqBodyParsed?.messages;
+    const isMultiTurn = Array.isArray(messages) && messages.length > 1;
+    const promptLen = typeof reqBodyParsed?.prompt === 'string' ? reqBodyParsed.prompt.length : 0;
+
+    if (isStream || isMultiTurn || promptLen > 500) {
+        let caller = '正文主聊';
+        if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '小白盒(正文)';
+        else if (s.includes('js-slash-runner') || s.includes('slash')) caller = 'Slash(正文)';
+        return { category: 'chat', caller };
+    }
+
+    // 5. 预设、工具、单句小脚本
     if (s.includes('littlewhitebox') || s.includes('xiaobai')) {
-        const messages = reqBodyParsed?.messages;
-        const isMultiTurn = Array.isArray(messages) && messages.length > 1;
-
-        // 如果是流式且多轮对话，或者在聊天队列中，归为“正文主聊”
-        if (isStream || isMultiTurn) {
-            return { category: 'chat', caller: '小白盒 (正文主聊)' };
-        } else {
-            // 只有单句探测、意图识别、独立小指令才算预设工具
-            return { category: 'preset_tools', caller: '小白盒 (意图/工具)' };
-        }
+        return { category: 'preset_tools', caller: '小白盒(工具/意图)' };
     }
-
-    // 4. 其他预设、模板、命令扩展
     if (s.includes('st-prompt-template')) {
-        return { category: 'preset_tools', caller: 'Prompt-Template' };
-    }
-    if (s.includes('js-slash-runner') || s.includes('slashcommand')) {
-        return { category: 'preset_tools', caller: 'Slash-Runner' };
+        return { category: 'preset_tools', caller: '预设模板' };
     }
     if (s.includes('translate')) {
-        return { category: 'preset_tools', caller: 'Translate' };
+        return { category: 'preset_tools', caller: '翻译扩展' };
     }
     if (s.includes('caption')) {
-        return { category: 'preset_tools', caller: 'Caption' };
+        return { category: 'preset_tools', caller: '图像描述' };
+    }
+    if (s.includes('js-slash-runner') || s.includes('slash')) {
+        return { category: 'preset_tools', caller: 'Slash脚本' };
     }
 
-    // 5. 正文主流程（script.js 核心）
-    if (s.includes('script.js') || s.includes('sendgenerationrequest') || s.includes('getchatcompletion')) {
-        return { category: 'chat', caller: '主聊正文' };
-    }
-
-    // 6. 提取第三方未知名扩展目录
+    // 6. 提取未知名第三方扩展
     const match = s.match(/extensions\/third-party\/([a-zA-Z0-9_-]+)/i);
     if (match && match[1]) {
         return { category: 'other', caller: match[1] };
     }
 
-    // 兜底：如果是流式多轮，默认主聊；否则归其他
-    if (isStream) {
-        return { category: 'chat', caller: '主聊管道' };
-    }
-
-    return { category: 'other', caller: '外部/其他扩展' };
+    return { category: 'chat', caller: '主聊管道' };
 }
 
 /**
@@ -309,7 +334,7 @@ function installFetchHook() {
         const url = args[0];
         const options = args[1] || {};
 
-        // 如果不是目标大模型 API，直接透传放行
+        // 如果不是目标 API，直接透传放行
         if (!isTargetLLMApi(url)) {
             return originalFetch.apply(this, args);
         }
@@ -347,13 +372,16 @@ function installFetchHook() {
                         trackerItem.prompt_tokens = estimateTokens(combinedText);
                     } else if (typeof parsedReq.prompt === 'string') {
                         trackerItem.prompt_tokens = estimateTokens(parsedReq.prompt);
+                    } else if (typeof parsedReq.input === 'string') {
+                        // TTS 常见参数 input
+                        trackerItem.prompt_tokens = estimateTokens(parsedReq.input);
                     }
                 } catch (_) {}
             }
 
-            // 抓取堆栈回溯，精准归因识别
+            // 抓取堆栈回溯与多维归因
             const stack = (new Error()).stack || '';
-            const classification = classifyRequest(stack, trackerItem.url, parsedReq, trackerItem.is_stream);
+            const classification = classifyRequest(stack, trackerItem.url, parsedReq, trackerItem.is_stream, trackerItem.model);
             trackerItem.category = classification.category;
             trackerItem.caller = classification.caller;
         } catch (prepErr) {
@@ -387,20 +415,21 @@ function installFetchHook() {
                         headers: response.headers,
                     });
                 } else {
-                    // 非流式响应：克隆 JSON
+                    // 非流式响应（含 TTS 音频或普通 JSON）
+                    trackerItem.duration_ms = Math.round(performance.now() - startTime);
                     const cloned = response.clone();
+
                     cloned.json().then(data => {
-                        trackerItem.duration_ms = Math.round(performance.now() - startTime);
                         if (data && data.usage) {
                             trackerItem.prompt_tokens = data.usage.prompt_tokens ?? trackerItem.prompt_tokens;
                             trackerItem.completion_tokens = data.usage.completion_tokens ?? 0;
                         } else {
                             const outText = data?.choices?.[0]?.message?.content || data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-                            trackerItem.completion_tokens = estimateTokens(outText);
+                            if (outText) trackerItem.completion_tokens = estimateTokens(outText);
                         }
                         recordApiUsage(trackerItem);
                     }).catch(() => {
-                        trackerItem.duration_ms = Math.round(performance.now() - startTime);
+                        // 如果是音频等非 JSON 格式（如 TTS 返回的 audio/wav）
                         recordApiUsage(trackerItem);
                     });
                 }
@@ -412,7 +441,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 全局底层网络拦截器已就绪 (v1.1.0, loading_order: 1)');
+    console.log('[OmniTracker] 全局底层网络拦截器已就绪 (v1.2.0)');
 }
 
 /**
@@ -442,6 +471,7 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 
                 try {
                     const parsed = JSON.parse(dataStr);
+                    // 优先提取官方 Usage
                     if (parsed.usage) {
                         officialUsage = parsed.usage;
                     }
@@ -468,7 +498,7 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 }
 
 /**
- * 挂载 UI 元素（包含自愈重试与顶栏开关检查）
+ * 挂载 UI 元素
  */
 function tryMountUI() {
     if (!window.$) {
@@ -480,7 +510,7 @@ function tryMountUI() {
     if (settings && settings.showInTopBar) {
         if ($('#omni_tracker_topbar_btn').length === 0) {
             const btnHtml = `
-                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击查看全量调用看板">
+                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击查看看板 (长按可隐藏)">
                     <i class="fa-solid fa-bolt"></i>
                     <span id="omni_tracker_topbar_text">0</span>
                 </div>
@@ -488,36 +518,58 @@ function tryMountUI() {
 
             if ($('#top-bar').length) {
                 $('#top-bar').append(btnHtml);
-                $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
             } else if ($('#chat_header').length) {
                 $('#chat_header').append(btnHtml);
-                $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
             }
+
+            $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
+
+            // 右键或长按提示快捷隐藏
+            $('#omni_tracker_topbar_btn').on('contextmenu', function (e) {
+                e.preventDefault();
+                if (confirm('是否隐藏顶栏快捷指示器？\n（隐藏后顶部更清爽，可随时在右侧扩展列表中重新打开或查看看板）')) {
+                    settings.showInTopBar = false;
+                    safeSaveSettings();
+                    $('#omni_tracker_topbar_btn').remove();
+                    syncDrawerCheckbox();
+                }
+            });
         }
     } else {
-        // 如果用户关闭了开关，彻底移除顶栏元素
         $('#omni_tracker_topbar_btn').remove();
     }
 
-    // 2. 挂载设置面板抽屉（即使顶栏关闭，这里也永远提供打开入口）
+    // 2. 挂载侧边栏设置抽屉（永久保留）
     mountExtensionSettingsDrawer();
     updateTopBarUI();
 }
 
 function mountExtensionSettingsDrawer() {
-    if ($('#extensions_settings').length === 0 || $('#omni_tracker_extension_settings').length) return;
+    if ($('#extensions_settings').length === 0 || $('#omni_tracker_extension_settings').length) {
+        syncDrawerCheckbox();
+        return;
+    }
 
     const drawerHtml = `
         <div id="omni_tracker_extension_settings" class="extension_container">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b><i class="fa-solid fa-bolt" style="color:#4ade80;"></i> Omni API 全量调用审计</b>
+                    <b><i class="fa-solid fa-bolt" style="color:#34d399;"></i> Omni API 全量调用审计</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
-                <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.2); border-radius: 6px;">
-                    <p style="font-size:12px; color:#cbd5e1; margin-bottom: 10px; line-height: 1.5;">
-                        底层透明监听：正文主聊、记忆插件（SP数据库/Smart-Context/Memory）、小白盒意图与工具、向量检索等全部 API 消耗。
+                <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.25); border-radius: 6px;">
+                    <p style="font-size:12px; color:#cbd5e1; margin-bottom: 12px; line-height: 1.5;">
+                        底层透明监听：正文主聊、记忆/SP数据库、TTS语音朗读、小白盒脚本、向量检索等全部 API 消耗。
                     </p>
+
+                    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding:8px 10px; background:rgba(255,255,255,0.05); border-radius:6px;">
+                        <span style="font-size:12px; font-weight:700; color:#fff;">显示顶栏快捷指示器</span>
+                        <label class="omni-switch">
+                            <input type="checkbox" id="omni_drawer_toggle_topbar" ${settings?.showInTopBar ? 'checked' : ''}>
+                            <span class="omni-slider"></span>
+                        </label>
+                    </div>
+
                     <div style="display:flex; gap:10px;">
                         <button class="menu_button" id="omni_open_dashboard_from_settings">
                             <i class="fa-solid fa-chart-pie"></i> 打开审计看板
@@ -529,6 +581,19 @@ function mountExtensionSettingsDrawer() {
     `;
     $('#extensions_settings').append(drawerHtml);
     $('#omni_open_dashboard_from_settings').on('click', showDashboardModal);
+
+    $('#omni_drawer_toggle_topbar').on('change', function () {
+        const isChecked = $(this).prop('checked');
+        settings.showInTopBar = isChecked;
+        safeSaveSettings();
+        tryMountUI();
+    });
+}
+
+function syncDrawerCheckbox() {
+    if (!settings) return;
+    $('#omni_drawer_toggle_topbar').prop('checked', !!settings.showInTopBar);
+    $('#omni_modal_toggle_topbar').prop('checked', !!settings.showInTopBar);
 }
 
 function triggerTopBarPulse() {
@@ -561,10 +626,10 @@ function showDashboardModal() {
                     <button class="omni-close-btn" id="omni_close_modal_btn" title="关闭看板"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="omni-tabs">
-                    <button class="omni-tab-btn active" data-tab="overview">📊 用量概览</button>
-                    <button class="omni-tab-btn" data-tab="logs">📜 实时调用流水</button>
+                    <button class="omni-tab-btn active" data-tab="overview">📊 概览</button>
+                    <button class="omni-tab-btn" data-tab="logs">📜 实时流水</button>
                     <button class="omni-tab-btn" data-tab="models">🤖 模型分布</button>
-                    <button class="omni-tab-btn" data-tab="settings">⚙️ 设置与维护</button>
+                    <button class="omni-tab-btn" data-tab="settings">⚙️ 设置</button>
                 </div>
                 <div class="omni-tab-panel" id="omni_tab_content">
                     <!-- 动态渲染 -->
@@ -664,7 +729,7 @@ function renderDashboardUI(activeTab) {
             </div>
 
             ${zeroCatsHtml ? `
-                <div class="omni-section-title" style="margin-top:22px; font-size:12px; color:#94a3b8 !important;">
+                <div class="omni-section-title" style="margin-top:20px; font-size:12px; color:#94a3b8 !important;">
                     <i class="fa-solid fa-minus"></i> 未产生调用的模块 (未开启或无请求)
                 </div>
                 <div>${zeroCatsHtml}</div>
@@ -673,7 +738,7 @@ function renderDashboardUI(activeTab) {
     } else if (activeTab === 'logs') {
         const logs = settings.recentLogs || [];
         if (logs.length === 0) {
-            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、或触发记忆/小白盒后台脚本时将在此实时显示。</div>');
+            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、或触发记忆/TTS后台脚本时将在此实时显示。</div>');
             return;
         }
 
@@ -685,8 +750,8 @@ function renderDashboardUI(activeTab) {
                 <tr>
                     <td style="color:#94a3b8;">${log.time}</td>
                     <td><span class="omni-badge ${badgeClass}">${catLabel}</span></td>
-                    <td style="color:#f8fafc; font-weight:600; max-width:140px; overflow:hidden; text-overflow:ellipsis;">${log.caller || '-'}</td>
-                    <td style="color:#38bdf8;">${log.model || '-'}</td>
+                    <td style="color:#f8fafc; font-weight:600; max-width:130px; overflow:hidden; text-overflow:ellipsis;">${log.caller || '-'}</td>
+                    <td style="color:#38bdf8; max-width:140px; overflow:hidden; text-overflow:ellipsis;">${log.model || '-'}</td>
                     <td>${formatTokens(log.prompt_tokens)}</td>
                     <td>${formatTokens(log.completion_tokens)}</td>
                     <td style="font-weight:700; color:#34d399;">${formatTokens(log.total_tokens)}</td>
@@ -696,7 +761,7 @@ function renderDashboardUI(activeTab) {
         }
 
         $panel.html(`
-            <div style="overflow-x:auto;">
+            <div class="omni-table-wrap">
                 <table class="omni-log-table">
                     <thead>
                         <tr>
@@ -739,7 +804,7 @@ function renderDashboardUI(activeTab) {
         }
 
         $panel.html(`
-            <div style="overflow-x:auto;">
+            <div class="omni-table-wrap">
                 <table class="omni-log-table">
                     <thead>
                         <tr>
@@ -760,15 +825,15 @@ function renderDashboardUI(activeTab) {
                 <div class="omni-setting-row">
                     <div>
                         <div class="omni-setting-label">显示顶栏快捷指示器</div>
-                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 今日消耗徽章（关闭后顶部更清爽，可随时从侧边栏扩展列表打开看板）</div>
+                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 消耗总量徽章（关闭后界面更清爽，可随时在扩展列表中打开看板）</div>
                     </div>
                     <label class="omni-switch">
-                        <input type="checkbox" id="omni_toggle_topbar" ${settings.showInTopBar ? 'checked' : ''}>
+                        <input type="checkbox" id="omni_modal_toggle_topbar" ${settings.showInTopBar ? 'checked' : ''}>
                         <span class="omni-slider"></span>
                     </label>
                 </div>
 
-                <div class="omni-actions" style="margin-top:24px;">
+                <div class="omni-actions" style="margin-top:20px;">
                     <button class="menu_button" id="omni_btn_reset_session"><i class="fa-solid fa-arrows-rotate"></i> 重置本次会话</button>
                     <button class="menu_button" id="omni_btn_reset_today"><i class="fa-solid fa-calendar-xmark"></i> 清空今日统计</button>
                     <button class="menu_button" id="omni_btn_export_json"><i class="fa-solid fa-file-export"></i> 导出审计记录 (JSON)</button>
@@ -777,18 +842,19 @@ function renderDashboardUI(activeTab) {
             </div>
         `);
 
-        // 顶栏开关事件
-        $('#omni_toggle_topbar').on('change', function () {
+        // 弹窗内开关事件
+        $('#omni_modal_toggle_topbar').on('change', function () {
             const isChecked = $(this).prop('checked');
             settings.showInTopBar = isChecked;
             safeSaveSettings();
+            syncDrawerCheckbox();
 
             if (isChecked) {
                 tryMountUI();
                 if (window.toastr) toastr.success('已开启顶栏指示器');
             } else {
                 $('#omni_tracker_topbar_btn').remove();
-                if (window.toastr) toastr.info('已隐藏顶栏指示器（可随时从扩展抽屉打开看板）');
+                if (window.toastr) toastr.info('已隐藏顶栏指示器（可随时从右侧扩展设置中重新打开）');
             }
         });
 
