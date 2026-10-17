@@ -1,25 +1,25 @@
 /**
- * Omni API Tracker for SillyTavern (v1.3.0)
- * 全量 API 调用审计与统计插件（双层哨兵架构：业务状态锁 + 底层网络拦截）
- * 彻底撕开插件套娃马甲，实现 正文 / 记忆(SP) / TTS语音 / 预设脚本 泾渭分明精准归因
+ * Omni API Tracker for SillyTavern (v1.4.0 冒险者公会与全量审计合体版)
+ * 融合双层哨兵流量审计 + 黎吧啦活跃时长心跳与 RPG 冒险者陪伴手账
  * 
- * @author ymf2317-tech
- * @version 1.3.0
+ * @author ymf2317-tech & @黎吧啦
+ * @version 1.4.0
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'st-omni-api-tracker';
+const LEGACY_USAGE_KEY = 'st_usage_tracker_local';
+const HEARTBEAT_INTERVAL = 15000; // 15秒心跳检测
 
-// 顶层状态机哨兵（捕获酒馆官方当前生命周期）
+// --- 顶层状态机哨兵（捕获酒馆官方生成生命周期）---
 let currentGenerationState = {
     isGenerating: false,
-    type: null, // 'normal' (正文) | 'quiet' (后台静默) | 'impersonate' | 'continue'
+    type: null,
     startTime: 0,
 };
 
-// 监听酒馆原生生成事件，获取官方身份证
 if (typeof eventSource !== 'undefined' && typeof event_types !== 'undefined') {
     try {
         eventSource.on(event_types.GENERATION_STARTED, (type, params, dryRun) => {
@@ -43,30 +43,58 @@ if (typeof eventSource !== 'undefined' && typeof event_types !== 'undefined') {
     }
 }
 
+// --- RPG 冒险者等级与成就配置 ---
+const RPG_CONFIG = {
+    titles: [
+        { h: 0, t: "迷途旅人", desc: "初次踏入这间赛博酒馆，一切都是未知的。" },
+        { h: 20, t: "酒馆常客", desc: "老板娘已经记住了你喜欢的饮品。" },
+        { h: 50, t: "见习编剧", desc: "你开始试图掌控角色的命运走向。" },
+        { h: 100, t: "角色塑造者", desc: "你的文字赋予了纸片人灵魂。" },
+        { h: 200, t: "世界架构师", desc: "世界书的条目在你的脑海中构建成型。" },
+        { h: 400, t: "提示词大师", desc: "你掌握了与机魂沟通的咒语。" },
+        { h: 700, t: "破壁人", desc: "第四面墙对你来说形同虚设。" },
+        { h: 1000, t: "时间领主", desc: "你可以随意回溯时间，修改因果。" },
+        { h: 1500, t: "虚空行者", desc: "你游走在上下文的边缘，窥视代码的深渊。" },
+        { h: 2000, t: "奇点见证者", desc: "你即是这片虚拟宇宙的终极主宰。" }
+    ],
+    achievements: [
+        { id: 'first_step', name: '初次链接', desc: '累计活跃时长达到 10 小时', check: (d, total) => total >= 10 },
+        { id: 'immersion', name: '沉浸体验', desc: '累计活跃时长达到 50 小时', check: (d, total) => total >= 50 },
+        { id: 'addicted', name: '赛博依赖', desc: '累计活跃时长达到 200 小时', check: (d, total) => total >= 200 },
+        { id: 'ascension', name: '数字飞升', desc: '累计活跃时长达到 1000 小时', check: (d, total) => total >= 1000 },
+        { id: 'marathon', name: '马拉松选手', desc: '单日在线活跃超过 8 小时', check: (entries) => entries.some(e => e.hours >= 8) },
+        { id: 'limit_break', name: '极限肝帝', desc: '单日在线活跃超过 16 小时', check: (entries) => entries.some(e => e.hours >= 16) },
+        { id: 'weekend', name: '周末狂欢', desc: '周末总时长占比 > 40% (需总时长>50h)', check: (entries, total) => {
+            const we = entries.filter(e => e.day === 0 || e.day === 6).reduce((s, i) => s + i.hours, 0);
+            return total > 50 && (we / total > 0.4);
+        }},
+        { id: 'streak_5', name: '无限续杯', desc: '连续 5 天每天超过 2 小时', check: (entries) => {
+            let streak = 0;
+            for (let e of entries) {
+                if (e.hours >= 2) streak++; else streak = 0;
+                if (streak >= 5) return true;
+            }
+            return false;
+        }},
+        { id: 'streak_14', name: '命运羁绊', desc: '连续 14 天每天超过 1 小时', check: (entries) => {
+            let streak = 0;
+            for (let e of entries) {
+                if (e.hours >= 1) streak++; else streak = 0;
+                if (streak >= 14) return true;
+            }
+            return false;
+        }},
+        { id: 'long_term', name: '细水长流', desc: '活跃天数超过 30 天', check: (entries) => entries.length >= 30 }
+    ]
+};
+
 // 默认存储结构
 const defaultSettings = {
     enabled: true,
-    showInTopBar: true, // 控制顶栏闪电徽章显示/隐藏
-    totals: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        requests: 0,
-    },
-    today: {
-        date: getTodayDateString(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        requests: 0,
-    },
-    session: {
-        startTime: Date.now(),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        requests: 0,
-    },
+    showInTopBar: true,
+    totals: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
+    today: { date: getTodayDateString(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
+    session: { startTime: Date.now(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     byCategory: {
         chat: { label: '正文主聊', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#38bdf8' },
         memory: { label: '记忆/总结/SP', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#ec4899' },
@@ -76,7 +104,12 @@ const defaultSettings = {
         other: { label: '其他扩展', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#8b5cf6' },
     },
     byModel: {},
-    recentLogs: [], // 最大 100 条实时日志
+    recentLogs: [],
+    // 活跃时长数据
+    activeTime: {
+        daily: {}, // { 'YYYY-MM-DD': milliseconds }
+        totalMs: 0,
+    }
 };
 
 let settings = null;
@@ -91,7 +124,6 @@ function loadSettings() {
     }
     settings = extension_settings[EXTENSION_NAME];
 
-    // 结构兜底
     for (const key of Object.keys(defaultSettings)) {
         if (settings[key] === undefined) {
             settings[key] = JSON.parse(JSON.stringify(defaultSettings[key]));
@@ -102,7 +134,14 @@ function loadSettings() {
         settings.byCategory.tts = { label: '语音朗读(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' };
     }
 
-    // 检查日期跨天
+    if (!settings.activeTime) {
+        settings.activeTime = { daily: {}, totalMs: 0 };
+    }
+
+    // 自动兼容并迁移黎吧啦旧脚本 (st_usage_tracker_local) 的历史活跃时长
+    migrateLegacyActiveTime();
+
+    // 跨天检查
     const today = getTodayDateString();
     if (settings.today.date !== today) {
         settings.today = {
@@ -114,6 +153,44 @@ function loadSettings() {
         };
         safeSaveSettings();
     }
+}
+
+function migrateLegacyActiveTime() {
+    try {
+        let legacy = localStorage.getItem(LEGACY_USAGE_KEY);
+        if (!legacy && window.extension_settings && window.extension_settings[LEGACY_USAGE_KEY]) {
+            legacy = JSON.stringify(window.extension_settings[LEGACY_USAGE_KEY]);
+        }
+        if (legacy) {
+            const parsed = JSON.parse(legacy);
+            if (typeof parsed === 'object') {
+                let mergedAny = false;
+                for (const [day, ms] of Object.entries(parsed)) {
+                    if (typeof ms === 'number') {
+                        if (!settings.activeTime.daily[day] || settings.activeTime.daily[day] < ms) {
+                            settings.activeTime.daily[day] = ms;
+                            mergedAny = true;
+                        }
+                    }
+                }
+                if (mergedAny) {
+                    recalculateTotalActiveMs();
+                    safeSaveSettings();
+                    console.log('[OmniTracker] 已成功融合历史活跃时长数据！');
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('[OmniTracker] Legacy time migration check:', e);
+    }
+}
+
+function recalculateTotalActiveMs() {
+    let sum = 0;
+    for (const ms of Object.values(settings.activeTime.daily)) {
+        sum += (ms || 0);
+    }
+    settings.activeTime.totalMs = sum;
 }
 
 function safeSaveSettings() {
@@ -130,6 +207,52 @@ function formatTokens(num) {
     if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
     return num.toLocaleString();
 }
+
+function msToHourMin(ms) {
+    const totalMin = Math.floor((ms || 0) / 60000);
+    const hours = Math.floor(totalMin / 60);
+    const minutes = totalMin % 60;
+    return { hours, minutes };
+}
+
+function formatDuration(ms) {
+    const { hours, minutes } = msToHourMin(ms);
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+}
+
+/**
+ * 活跃时长心跳累加器
+ */
+let isWindowActive = true;
+window.addEventListener('focus', () => { isWindowActive = true; });
+window.addEventListener('blur', () => { isWindowActive = false; });
+document.addEventListener('visibilitychange', () => { isWindowActive = !document.hidden; });
+
+function addActiveDuration(ms) {
+    if (!settings || !settings.activeTime) return;
+    const today = getTodayDateString();
+    if (!settings.activeTime.daily[today]) {
+        settings.activeTime.daily[today] = 0;
+    }
+    settings.activeTime.daily[today] += ms;
+    settings.activeTime.totalMs = (settings.activeTime.totalMs || 0) + ms;
+
+    // 同步写入 localStorage 双重保险
+    try {
+        localStorage.setItem(LEGACY_USAGE_KEY, JSON.stringify(settings.activeTime.daily));
+    } catch (_) {}
+
+    safeSaveSettings();
+    updateTopBarUI();
+}
+
+// 启动 15 秒心跳定时器
+setInterval(() => {
+    if (isWindowActive && !document.hidden) {
+        addActiveDuration(HEARTBEAT_INTERVAL);
+    }
+}, HEARTBEAT_INTERVAL);
 
 /**
  * 现代大模型高精度分词估算器（对齐 BPE / cl100k / DeepSeek 真实词元压缩比）
@@ -155,7 +278,6 @@ function isTargetLLMApi(url) {
 
     if (!urlStr) return false;
 
-    // 酒馆后端代理端点
     if (urlStr.includes('/api/backends/chat-completions') ||
         urlStr.includes('/api/backends/text-completions') ||
         urlStr.includes('/api/backends/embeddings') ||
@@ -164,7 +286,6 @@ function isTargetLLMApi(url) {
         return true;
     }
 
-    // 直连 OpenAI 格式端点或 TTS 端点
     if (urlStr.includes('/v1/chat/completions') ||
         urlStr.includes('/v1/completions') ||
         urlStr.includes('/v1/embeddings') ||
@@ -177,15 +298,14 @@ function isTargetLLMApi(url) {
 }
 
 /**
- * 双层哨兵归因算法：
- * 结合上层生命周期状态锁 (currentGenerationState) + 底层请求指纹与模型标识
+ * 双层哨兵归因算法
  */
 function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
     const s = (stack || '').toLowerCase();
     const u = (url || '').toLowerCase();
     const m = (modelName || '').toLowerCase();
 
-    // 1. 优先级最高：TTS 语音朗读（独立分类）
+    // 1. 优先级最高：TTS 语音朗读
     const isTTS = m.includes('tts') ||
         m.includes('mimo') ||
         m.includes('voice') ||
@@ -207,8 +327,7 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'vectors', caller: '向量检索' };
     }
 
-    // 3. 正文主聊判定（剥离 Slash-Runner 和小白盒马甲）
-    // 只要上层状态机处于 normal/impersonate/continue 期间，或者是流式多轮，哪怕堆栈里有 Slash-Runner，也是正文！
+    // 3. 正文主聊判定（剥离套娃马甲）
     const isNormalCycle = (currentGenerationState.isGenerating &&
         (currentGenerationState.type === 'normal' || currentGenerationState.type === 'impersonate' || currentGenerationState.type === 'continue'));
 
@@ -223,7 +342,7 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'chat', caller };
     }
 
-    // 4. 记忆与长程数据库类（包含 SP 数据库、酒馆助手、Smart Context、ST原生记忆、总结）
+    // 4. 记忆与长程数据库类
     const isMemoryRelated = (currentGenerationState.type === 'quiet' && (s.includes('memory') || s.includes('summary'))) ||
         s.includes('smart-context') ||
         s.includes('extensions/memory') ||
@@ -280,38 +399,32 @@ function recordApiUsage(item) {
     const cTokens = Math.max(0, parseInt(item.completion_tokens) || 0);
     const tTokens = pTokens + cTokens;
 
-    // 跨天检查
     const today = getTodayDateString();
     if (settings.today.date !== today) {
         settings.today = { date: today, prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 };
     }
 
-    // 1. 全局累计
     settings.totals.prompt_tokens += pTokens;
     settings.totals.completion_tokens += cTokens;
     settings.totals.total_tokens += tTokens;
     settings.totals.requests += 1;
 
-    // 2. 今日
     settings.today.prompt_tokens += pTokens;
     settings.today.completion_tokens += cTokens;
     settings.today.total_tokens += tTokens;
     settings.today.requests += 1;
 
-    // 3. 本次 Session
     settings.session.prompt_tokens += pTokens;
     settings.session.completion_tokens += cTokens;
     settings.session.total_tokens += tTokens;
     settings.session.requests += 1;
 
-    // 4. 分类统计
     const cat = settings.byCategory[item.category] || settings.byCategory.other;
     cat.prompt_tokens += pTokens;
     cat.completion_tokens += cTokens;
     cat.total_tokens += tTokens;
     cat.requests += 1;
 
-    // 5. 模型统计
     const mName = item.model || 'Unknown';
     if (!settings.byModel[mName]) {
         settings.byModel[mName] = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 };
@@ -321,7 +434,6 @@ function recordApiUsage(item) {
     settings.byModel[mName].total_tokens += tTokens;
     settings.byModel[mName].requests += 1;
 
-    // 6. 实时流水日志
     const logEntry = {
         id: Date.now() + Math.random().toString(36).substring(2, 6),
         time: new Date().toLocaleTimeString(),
@@ -340,10 +452,7 @@ function recordApiUsage(item) {
         settings.recentLogs.pop();
     }
 
-    // 持久化存储
     safeSaveSettings();
-
-    // 更新 UI 视图
     updateTopBarUI();
     if (window.$ && $('#omni_tracker_modal').is(':visible')) {
         renderDashboardUI();
@@ -386,7 +495,6 @@ function installFetchHook() {
                     trackerItem.model = parsedReq.model || trackerItem.model;
                     trackerItem.is_stream = !!parsedReq.stream;
 
-                    // 估算输入 Token 兜底
                     if (Array.isArray(parsedReq.messages)) {
                         let combinedText = '';
                         for (const m of parsedReq.messages) {
@@ -420,7 +528,6 @@ function installFetchHook() {
 
         try {
             if (response && response.ok) {
-                // 流式响应 (SSE)：利用 body.tee() 旁路镜像
                 if (trackerItem.is_stream && response.body && typeof response.body.tee === 'function') {
                     const [streamMain, streamTracker] = response.body.tee();
                     consumeStreamForMetrics(streamTracker, trackerItem, startTime);
@@ -444,7 +551,6 @@ function installFetchHook() {
                         }
                         recordApiUsage(trackerItem);
                     }).catch(() => {
-                        // 音频等二进制响应 (TTS)
                         recordApiUsage(trackerItem);
                     });
                 }
@@ -456,7 +562,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 双层哨兵网络拦截器已就绪 (v1.3.0)');
+    console.log('[OmniTracker] 流量审计与冒险者公会手账已就绪 (v1.4.0)');
 }
 
 async function consumeStreamForMetrics(stream, trackerItem, startTime) {
@@ -517,7 +623,6 @@ function tryMountUI() {
         return;
     }
 
-    // 1. 顶栏指示器
     if (settings && settings.showInTopBar) {
         if ($('#omni_tracker_topbar_btn').length === 0) {
             const btnHtml = `
@@ -563,12 +668,12 @@ function mountExtensionSettingsDrawer() {
         <div id="omni_tracker_extension_settings" class="extension_container">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b><i class="fa-solid fa-bolt" style="color:#34d399;"></i> Omni API 全量调用审计</b>
+                    <b><i class="fa-solid fa-bolt" style="color:#34d399;"></i> Omni 审计与冒险者公会手账</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.25); border-radius: 6px;">
                     <p style="font-size:12px; color:#cbd5e1; margin-bottom: 12px; line-height: 1.5;">
-                        双层哨兵透明监听：正文主聊、记忆/SP数据库、TTS语音朗读、小白盒脚本、向量检索等全部 API 消耗。
+                        双层哨兵全量监听（正文/记忆/TTS/预设）；内置冒险者公会活跃时长、RPG等级与成就图鉴。
                     </p>
 
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding:8px 10px; background:rgba(255,255,255,0.05); border-radius:6px;">
@@ -581,7 +686,7 @@ function mountExtensionSettingsDrawer() {
 
                     <div style="display:flex; gap:10px;">
                         <button class="menu_button" id="omni_open_dashboard_from_settings">
-                            <i class="fa-solid fa-chart-pie"></i> 打开审计看板
+                            <i class="fa-solid fa-chart-pie"></i> 打开审计与公会看板
                         </button>
                     </div>
                 </div>
@@ -616,8 +721,13 @@ function triggerTopBarPulse() {
 
 function updateTopBarUI() {
     if (!settings || !window.$) return;
-    const count = settings.today?.total_tokens || 0;
-    $('#omni_tracker_topbar_text').text(formatTokens(count));
+    const tokenStr = formatTokens(settings.today?.total_tokens || 0);
+    const today = getTodayDateString();
+    const todayMs = settings.activeTime?.daily?.[today] || 0;
+    const timeStr = formatDuration(todayMs);
+
+    // 胶囊显示：Token + 时长
+    $('#omni_tracker_topbar_text').text(`${tokenStr} | ${timeStr}`);
 }
 
 function showDashboardModal() {
@@ -631,14 +741,15 @@ function showDashboardModal() {
         <div id="omni_tracker_modal" class="omni-modal-overlay">
             <div class="omni-modal-content">
                 <div class="omni-modal-header">
-                    <h3><i class="fa-solid fa-chart-pie" style="color:#34d399;"></i> Omni API 全量调用审计看板</h3>
+                    <h3><i class="fa-solid fa-shield-halved" style="color:#34d399;"></i> Omni 流量审计与冒险者公会</h3>
                     <button class="omni-close-btn" id="omni_close_modal_btn" title="关闭看板"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="omni-tabs">
-                    <button class="omni-tab-btn active" data-tab="overview">📊 概览</button>
-                    <button class="omni-tab-btn" data-tab="logs">📜 流水</button>
-                    <button class="omni-tab-btn" data-tab="models">🤖 模型</button>
-                    <button class="omni-tab-btn" data-tab="settings">⚙️ 设置</button>
+                    <button class="omni-tab-btn active" data-tab="overview">📊 用量概览</button>
+                    <button class="omni-tab-btn" data-tab="rpg">🏰 陪伴手账</button>
+                    <button class="omni-tab-btn" data-tab="logs">📜 实时流水</button>
+                    <button class="omni-tab-btn" data-tab="models">🤖 模型分布</button>
+                    <button class="omni-tab-btn" data-tab="settings">⚙️ 设置维护</button>
                 </div>
                 <div class="omni-tab-panel" id="omni_tab_content">
                     <!-- 动态渲染 -->
@@ -677,6 +788,9 @@ function renderDashboardUI(activeTab) {
         const today = settings.today;
         const session = settings.session;
         const total = settings.totals;
+        const todayDate = getTodayDateString();
+        const todayActiveMs = settings.activeTime?.daily?.[todayDate] || 0;
+        const totalActiveMs = settings.activeTime?.totalMs || 0;
 
         const catTotal = Math.max(1, Object.values(settings.byCategory).reduce((acc, c) => acc + (c.total_tokens || 0), 0));
 
@@ -720,14 +834,14 @@ function renderDashboardUI(activeTab) {
                     <div class="omni-stat-sub">入: ${formatTokens(today.prompt_tokens)} | 出: ${formatTokens(today.completion_tokens)}</div>
                 </div>
                 <div class="omni-stat-card">
+                    <div class="omni-stat-title">今日活跃时长</div>
+                    <div class="omni-stat-value" style="color:#fbbf24 !important;">${formatDuration(todayActiveMs)}</div>
+                    <div class="omni-stat-sub">累计投入: ${formatDuration(totalActiveMs)}</div>
+                </div>
+                <div class="omni-stat-card">
                     <div class="omni-stat-title">本次会话</div>
                     <div class="omni-stat-value" style="color:#60a5fa !important;">${formatTokens(session.total_tokens)}</div>
                     <div class="omni-stat-sub">${session.requests} 次 API 调用</div>
-                </div>
-                <div class="omni-stat-card">
-                    <div class="omni-stat-title">历史累计调用</div>
-                    <div class="omni-stat-value" style="color:#c084fc !important;">${formatTokens(total.total_tokens)}</div>
-                    <div class="omni-stat-sub">共 ${total.requests} 次交互</div>
                 </div>
             </div>
 
@@ -742,6 +856,115 @@ function renderDashboardUI(activeTab) {
                 </div>
                 <div>${zeroCatsHtml}</div>
             ` : ''}
+        `);
+    } else if (activeTab === 'rpg') {
+        // --- 🏰 陪伴手账（RPG冒险者公会）---
+        const daily = settings.activeTime?.daily || {};
+        const entries = Object.keys(daily).map(d => ({
+            date: d,
+            hours: (daily[d] || 0) / 3600000,
+            day: new Date(d).getDay(),
+        })).sort((a, b) => a.date.localeCompare(b.date));
+
+        const totalHours = (settings.activeTime?.totalMs || 0) / 3600000;
+        const level = Math.floor(totalHours / 10) + 1;
+        const currentExp = totalHours % 10;
+        const expPct = Math.min(100, (currentExp / 10) * 100).toFixed(1);
+
+        let myTitle = RPG_CONFIG.titles[0];
+        for (let t of RPG_CONFIG.titles) {
+            if (totalHours >= t.h) myTitle = t;
+        }
+
+        let achieveHtml = '';
+        RPG_CONFIG.achievements.forEach(ach => {
+            const unlocked = ach.check(entries, totalHours);
+            achieveHtml += `
+                <div class="omni-achieve-card ${unlocked ? 'unlocked' : ''}">
+                    <div class="omni-achieve-name">
+                        <span>${ach.name}</span>
+                        <span>${unlocked ? '🏆' : '🔒'}</span>
+                    </div>
+                    <div class="omni-achieve-desc">${ach.desc}</div>
+                </div>
+            `;
+        });
+
+        const top5 = [...entries].sort((a, b) => b.hours - a.hours).slice(0, 5);
+        const weekMap = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+        let top5Rows = '';
+        top5.forEach(e => {
+            top5Rows += `
+                <tr>
+                    <td style="color:#ffffff;">${e.date}</td>
+                    <td style="color:#94a3b8;">${weekMap[e.day]}</td>
+                    <td style="font-weight:700; color:#fbbf24;">${e.hours.toFixed(1)} 小时</td>
+                </tr>
+            `;
+        });
+
+        const recent7 = entries.slice(-7);
+        let maxH = Math.max(1, ...recent7.map(e => e.hours));
+        let svgBars = '';
+        recent7.forEach((e, idx) => {
+            const h = (e.hours / maxH) * 80;
+            const x = idx * 42 + 20;
+            const y = 95 - h;
+            svgBars += `
+                <rect x="${x}" y="${y}" width="24" height="${h}" rx="3" fill="#34d399" opacity="0.85"></rect>
+                <text x="${x + 12}" y="${y - 4}" fill="#fbbf24" font-size="9" text-anchor="middle">${e.hours.toFixed(1)}h</text>
+                <text x="${x + 12}" y="112" fill="#94a3b8" font-size="9" text-anchor="middle">${e.date.slice(5)}</text>
+            `;
+        });
+
+        $panel.html(`
+            <div class="omni-rpg-hero">
+                <div class="omni-rpg-header">
+                    <div>
+                        <div style="font-size:11px; color:#fbbf24; font-weight:700; text-transform:uppercase;">当前称号</div>
+                        <div class="omni-rpg-title-text">${myTitle.t}</div>
+                    </div>
+                    <div class="omni-rpg-level-badge">
+                        <span style="font-size:9px; opacity:0.8;">LV</span>
+                        <span style="font-size:16px;">${level}</span>
+                    </div>
+                </div>
+                <div style="font-size:12px; color:#94a3b8; font-style:italic; margin-bottom:8px;">"${myTitle.desc}"</div>
+                
+                <div style="display:flex; justify-content:space-between; font-size:12px; font-weight:700; margin-top:10px;">
+                    <span style="color:#ffffff;">总潜行时长: ${totalHours.toFixed(1)} Hours</span>
+                    <span style="color:#fbbf24;">进度: ${currentExp.toFixed(1)} / 10 h (${expPct}%)</span>
+                </div>
+                <div class="omni-rpg-exp-bar">
+                    <div class="omni-rpg-exp-fill" style="width: ${expPct}%;"></div>
+                </div>
+            </div>
+
+            <div class="omni-section-title"><i class="fa-solid fa-chart-column" style="color:#34d399;"></i> 最近活跃趋势 (7 Days)</div>
+            <div class="omni-chart-box">
+                ${recent7.length ? `
+                    <svg viewBox="0 0 320 120" style="width:100%; height:130px; display:block;">
+                        ${svgBars}
+                    </svg>
+                ` : '<div style="text-align:center; padding:30px; color:#94a3b8; font-size:12px;">暂无历史活跃天数记录</div>'}
+            </div>
+
+            <div class="omni-section-title"><i class="fa-solid fa-trophy" style="color:#fbbf24;"></i> 成就图鉴</div>
+            <div class="omni-achieve-grid">
+                ${achieveHtml}
+            </div>
+
+            <div class="omni-section-title"><i class="fa-solid fa-crown" style="color:#f59e0b;"></i> 肝帝时刻 Top 5</div>
+            <div class="omni-table-wrap" style="background:#1b1b28; border-radius:8px; border:1px solid #28283c;">
+                <table class="omni-log-table">
+                    <thead>
+                        <tr><th>日期</th><th>星期</th><th>单日活跃时长</th></tr>
+                    </thead>
+                    <tbody>
+                        ${top5Rows || '<tr><td colspan="3" style="text-align:center; color:#94a3b8;">暂无数据</td></tr>'}
+                    </tbody>
+                </table>
+            </div>
         `);
     } else if (activeTab === 'logs') {
         const logs = settings.recentLogs || [];
@@ -833,7 +1056,7 @@ function renderDashboardUI(activeTab) {
                 <div class="omni-setting-row">
                     <div>
                         <div class="omni-setting-label">显示顶栏快捷指示器</div>
-                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 消耗总量徽章（关闭后界面更清爽，可随时在扩展列表中打开看板）</div>
+                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 今日消耗与活跃时长（关闭后界面更清爽，可随时在扩展列表中打开看板）</div>
                     </div>
                     <label class="omni-switch">
                         <input type="checkbox" id="omni_modal_toggle_topbar" ${settings.showInTopBar ? 'checked' : ''}>
@@ -844,7 +1067,9 @@ function renderDashboardUI(activeTab) {
                 <div class="omni-actions" style="margin-top:20px;">
                     <button class="menu_button" id="omni_btn_reset_session"><i class="fa-solid fa-arrows-rotate"></i> 重置本次会话</button>
                     <button class="menu_button" id="omni_btn_reset_today"><i class="fa-solid fa-calendar-xmark"></i> 清空今日统计</button>
-                    <button class="menu_button" id="omni_btn_export_json"><i class="fa-solid fa-file-export"></i> 导出审计记录 (JSON)</button>
+                    <button class="menu_button" id="omni_btn_export_json"><i class="fa-solid fa-file-export"></i> 导出完整数据 (JSON)</button>
+                    <button class="menu_button" id="omni_btn_import_trigger"><i class="fa-solid fa-file-import"></i> 导入数据 (支持旧时长文件)</button>
+                    <input type="file" id="omni_file_input" accept=".json" style="display:none;">
                     <button class="menu_button" id="omni_btn_clear_all" style="background:#7f1d1d !important; color:#fca5a5 !important;"><i class="fa-solid fa-trash"></i> 清空全部历史数据</button>
                 </div>
             </div>
@@ -881,28 +1106,68 @@ function renderDashboardUI(activeTab) {
             if (window.toastr) toastr.success('今日用量统计已重置');
         });
 
+        // 导出 JSON
         $('#omni_btn_export_json').on('click', () => {
             const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(settings, null, 2));
             const dlAnchor = document.createElement('a');
             dlAnchor.setAttribute('href', dataStr);
-            dlAnchor.setAttribute('download', `omni-api-tracker-export-${getTodayDateString()}.json`);
+            dlAnchor.setAttribute('download', `omni-tracker-backup-${getTodayDateString()}.json`);
             dlAnchor.click();
         });
 
+        // 导入 JSON（兼容 Omni 完整备份与黎吧啦活跃时长 JSON）
+        $('#omni_btn_import_trigger').on('click', () => $('#omni_file_input').click());
+        $('#omni_file_input').on('change', function (e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function (evt) {
+                try {
+                    const data = JSON.parse(evt.target.result);
+                    if (data && typeof data === 'object') {
+                        const isDailyTimeFormat = Object.keys(data).some(k => /^\d{4}-\d{2}-\d{2}$/.test(k) && typeof data[k] === 'number');
+
+                        if (isDailyTimeFormat) {
+                            for (const [day, ms] of Object.entries(data)) {
+                                if (typeof ms === 'number') {
+                                    settings.activeTime.daily[day] = Math.max(settings.activeTime.daily[day] || 0, ms);
+                                }
+                            }
+                            recalculateTotalActiveMs();
+                            if (window.toastr) toastr.success('成功合并历史活跃时长数据！');
+                        } else if (data.totals || data.activeTime) {
+                            Object.assign(settings, data);
+                            recalculateTotalActiveMs();
+                            if (window.toastr) toastr.success('成功恢复 OmniTracker 完整数据！');
+                        }
+                        safeSaveSettings();
+                        renderDashboardUI('settings');
+                        updateTopBarUI();
+                    }
+                } catch (err) {
+                    if (window.toastr) toastr.error('导入失败：无效的 JSON 格式');
+                } finally {
+                    e.target.value = '';
+                }
+            };
+            reader.readAsText(file);
+        });
+
         $('#omni_btn_clear_all').on('click', () => {
-            if (confirm('确定要清空全部 API 调用审计记录吗？该操作不可撤销。')) {
+            if (confirm('确定要清空全部 API 调用审计与活跃时长记录吗？该操作不可撤销。')) {
                 extension_settings[EXTENSION_NAME] = JSON.parse(JSON.stringify(defaultSettings));
                 settings = extension_settings[EXTENSION_NAME];
+                localStorage.removeItem(LEGACY_USAGE_KEY);
                 safeSaveSettings();
                 renderDashboardUI('settings');
                 updateTopBarUI();
-                if (window.toastr) toastr.success('所有统计数据已清空');
+                if (window.toastr) toastr.success('所有统计与时长数据已清空');
             }
         });
     }
 }
 
-// 扩展初始化入口（页面加载时立即执行）
+// 扩展初始化入口
 (function () {
     loadSettings();
     installFetchHook();
