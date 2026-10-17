@@ -1,20 +1,47 @@
 /**
- * Omni API Tracker for SillyTavern
- * 全量 API 调用审计与统计插件（正文 + 记忆/SP数据库 + 小白盒工具 + TTS语音 + 向量检索 100% 全量捕获）
- * 
- * 核心原理：
- * 采用全局底层网络请求代理（Global Fetch Interceptor）与流管道旁路镜像（ReadableStream.tee()），
- * 在完全不影响酒馆原生打字机流式渲染与各插件业务逻辑的前提下，
- * 彻底捕获所有发往大模型或嵌入向量服务的请求，并基于调用栈（Call Stack）进行插件精确归因。
+ * Omni API Tracker for SillyTavern (v1.3.0)
+ * 全量 API 调用审计与统计插件（双层哨兵架构：业务状态锁 + 底层网络拦截）
+ * 彻底撕开插件套娃马甲，实现 正文 / 记忆(SP) / TTS语音 / 预设脚本 泾渭分明精准归因
  * 
  * @author ymf2317-tech
- * @version 1.2.0
+ * @version 1.3.0
  */
 
-import { saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'st-omni-api-tracker';
+
+// 顶层状态机哨兵（捕获酒馆官方当前生命周期）
+let currentGenerationState = {
+    isGenerating: false,
+    type: null, // 'normal' (正文) | 'quiet' (后台静默) | 'impersonate' | 'continue'
+    startTime: 0,
+};
+
+// 监听酒馆原生生成事件，获取官方身份证
+if (typeof eventSource !== 'undefined' && typeof event_types !== 'undefined') {
+    try {
+        eventSource.on(event_types.GENERATION_STARTED, (type, params, dryRun) => {
+            if (dryRun) return;
+            currentGenerationState.isGenerating = true;
+            currentGenerationState.type = type || 'normal';
+            currentGenerationState.startTime = Date.now();
+        });
+
+        eventSource.on(event_types.GENERATION_STOPPED, () => {
+            currentGenerationState.isGenerating = false;
+            currentGenerationState.type = null;
+        });
+
+        eventSource.on(event_types.MESSAGE_RECEIVED, () => {
+            currentGenerationState.isGenerating = false;
+            currentGenerationState.type = null;
+        });
+    } catch (e) {
+        console.warn('[OmniTracker] Event listener init warn:', e);
+    }
+}
 
 // 默认存储结构
 const defaultSettings = {
@@ -71,7 +98,6 @@ function loadSettings() {
         }
     }
 
-    // 确保有 tts 分类
     if (!settings.byCategory.tts) {
         settings.byCategory.tts = { label: '语音朗读(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' };
     }
@@ -106,18 +132,13 @@ function formatTokens(num) {
 }
 
 /**
- * 现代大模型高精度分词估算器（对齐 BPE / cl100k / deepseek 分词器）
+ * 现代大模型高精度分词估算器（对齐 BPE / cl100k / DeepSeek 真实词元压缩比）
  */
 function estimateTokens(text) {
     if (!text || typeof text !== 'string') return 0;
-    // 中文字符（含中文标点）
     const chineseChars = (text.match(/[\u4e00-\u9fa5\u3000-\u303f\uff01-\uff5e]/g) || []).length;
-    // 英文单词与字符
     const otherChars = text.length - chineseChars;
-    // 换行符与格式标记单独加权
     const newlines = (text.match(/\n/g) || []).length;
-
-    // 中文平均 1 字 ≈ 1.05 token；英文与符号按 3.2 字符 ≈ 1 token
     const estimated = Math.round(chineseChars * 1.05 + (otherChars / 3.2) + (newlines * 0.5));
     return Math.max(1, estimated);
 }
@@ -156,15 +177,15 @@ function isTargetLLMApi(url) {
 }
 
 /**
- * 核心多维归因识别器（重构优先级，杜绝误判）
- * 优先级：TTS 语音 > 向量嵌入 > 记忆/SP数据库 > 正文主聊 > 预设/工具 > 其他
+ * 双层哨兵归因算法：
+ * 结合上层生命周期状态锁 (currentGenerationState) + 底层请求指纹与模型标识
  */
 function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
     const s = (stack || '').toLowerCase();
     const u = (url || '').toLowerCase();
     const m = (modelName || '').toLowerCase();
 
-    // 1. 优先判定：TTS / 语音朗读（独立分类）
+    // 1. 优先级最高：TTS 语音朗读（独立分类）
     const isTTS = m.includes('tts') ||
         m.includes('mimo') ||
         m.includes('voice') ||
@@ -186,8 +207,25 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'vectors', caller: '向量检索' };
     }
 
-    // 3. 记忆与长程数据库类（包含 SP 数据库、酒馆助手、Smart Context、ST原生记忆、总结）
-    const isMemoryRelated = s.includes('smart-context') ||
+    // 3. 正文主聊判定（剥离 Slash-Runner 和小白盒马甲）
+    // 只要上层状态机处于 normal/impersonate/continue 期间，或者是流式多轮，哪怕堆栈里有 Slash-Runner，也是正文！
+    const isNormalCycle = (currentGenerationState.isGenerating &&
+        (currentGenerationState.type === 'normal' || currentGenerationState.type === 'impersonate' || currentGenerationState.type === 'continue'));
+
+    const messages = reqBodyParsed?.messages;
+    const isMultiTurn = Array.isArray(messages) && messages.length > 1;
+    const promptLen = typeof reqBodyParsed?.prompt === 'string' ? reqBodyParsed.prompt.length : 0;
+
+    if (isNormalCycle || isStream || isMultiTurn || promptLen > 500) {
+        let caller = '主聊正文';
+        if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '正文 (经小白盒)';
+        else if (s.includes('js-slash-runner') || s.includes('slash')) caller = '正文 (经SlashRunner)';
+        return { category: 'chat', caller };
+    }
+
+    // 4. 记忆与长程数据库类（包含 SP 数据库、酒馆助手、Smart Context、ST原生记忆、总结）
+    const isMemoryRelated = (currentGenerationState.type === 'quiet' && (s.includes('memory') || s.includes('summary'))) ||
+        s.includes('smart-context') ||
         s.includes('extensions/memory') ||
         s.includes('/memory/') ||
         s.includes('sp_database') ||
@@ -206,18 +244,6 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'memory', caller };
     }
 
-    // 4. 正文主聊判定（长上下文、多轮对话或流式生成，无论外面被谁包装，其本质就是主聊）
-    const messages = reqBodyParsed?.messages;
-    const isMultiTurn = Array.isArray(messages) && messages.length > 1;
-    const promptLen = typeof reqBodyParsed?.prompt === 'string' ? reqBodyParsed.prompt.length : 0;
-
-    if (isStream || isMultiTurn || promptLen > 500) {
-        let caller = '正文主聊';
-        if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '小白盒(正文)';
-        else if (s.includes('js-slash-runner') || s.includes('slash')) caller = 'Slash(正文)';
-        return { category: 'chat', caller };
-    }
-
     // 5. 预设、工具、单句小脚本
     if (s.includes('littlewhitebox') || s.includes('xiaobai')) {
         return { category: 'preset_tools', caller: '小白盒(工具/意图)' };
@@ -232,7 +258,7 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'preset_tools', caller: '图像描述' };
     }
     if (s.includes('js-slash-runner') || s.includes('slash')) {
-        return { category: 'preset_tools', caller: 'Slash脚本' };
+        return { category: 'preset_tools', caller: 'Slash宏脚本' };
     }
 
     // 6. 提取未知名第三方扩展
@@ -334,12 +360,10 @@ function installFetchHook() {
         const url = args[0];
         const options = args[1] || {};
 
-        // 如果不是目标 API，直接透传放行
         if (!isTargetLLMApi(url)) {
             return originalFetch.apply(this, args);
         }
 
-        // 构造跟踪项
         let trackerItem = {
             url: typeof url === 'string' ? url : (url.url || ''),
             model: 'Unknown',
@@ -354,7 +378,6 @@ function installFetchHook() {
         const startTime = performance.now();
 
         try {
-            // 解析请求体
             let parsedReq = null;
             const reqBody = options.body;
             if (reqBody && typeof reqBody === 'string') {
@@ -373,13 +396,11 @@ function installFetchHook() {
                     } else if (typeof parsedReq.prompt === 'string') {
                         trackerItem.prompt_tokens = estimateTokens(parsedReq.prompt);
                     } else if (typeof parsedReq.input === 'string') {
-                        // TTS 常见参数 input
                         trackerItem.prompt_tokens = estimateTokens(parsedReq.input);
                     }
                 } catch (_) {}
             }
 
-            // 抓取堆栈回溯与多维归因
             const stack = (new Error()).stack || '';
             const classification = classifyRequest(stack, trackerItem.url, parsedReq, trackerItem.is_stream, trackerItem.model);
             trackerItem.category = classification.category;
@@ -388,10 +409,8 @@ function installFetchHook() {
             console.warn('[OmniTracker] Trace error (ignorable):', prepErr);
         }
 
-        // 触发顶栏微动效提示
         triggerTopBarPulse();
 
-        // 执行真实网络请求
         let response;
         try {
             response = await originalFetch.apply(this, args);
@@ -399,14 +418,11 @@ function installFetchHook() {
             throw fetchErr;
         }
 
-        // 分析响应
         try {
             if (response && response.ok) {
-                // 流式响应 (SSE)：利用 body.tee() 进行无损旁路镜像
+                // 流式响应 (SSE)：利用 body.tee() 旁路镜像
                 if (trackerItem.is_stream && response.body && typeof response.body.tee === 'function') {
                     const [streamMain, streamTracker] = response.body.tee();
-
-                    // 异步后台消费 streamTracker，完全不阻塞主渲染
                     consumeStreamForMetrics(streamTracker, trackerItem, startTime);
 
                     return new Response(streamMain, {
@@ -415,7 +431,6 @@ function installFetchHook() {
                         headers: response.headers,
                     });
                 } else {
-                    // 非流式响应（含 TTS 音频或普通 JSON）
                     trackerItem.duration_ms = Math.round(performance.now() - startTime);
                     const cloned = response.clone();
 
@@ -429,7 +444,7 @@ function installFetchHook() {
                         }
                         recordApiUsage(trackerItem);
                     }).catch(() => {
-                        // 如果是音频等非 JSON 格式（如 TTS 返回的 audio/wav）
+                        // 音频等二进制响应 (TTS)
                         recordApiUsage(trackerItem);
                     });
                 }
@@ -441,12 +456,9 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 全局底层网络拦截器已就绪 (v1.2.0)');
+    console.log('[OmniTracker] 双层哨兵网络拦截器已就绪 (v1.3.0)');
 }
 
-/**
- * 旁路静默解析 SSE 流，读取官方 Usage 或累积字符
- */
 async function consumeStreamForMetrics(stream, trackerItem, startTime) {
     const reader = stream.getReader();
     const decoder = new TextDecoder('utf-8');
@@ -471,7 +483,6 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 
                 try {
                     const parsed = JSON.parse(dataStr);
-                    // 优先提取官方 Usage
                     if (parsed.usage) {
                         officialUsage = parsed.usage;
                     }
@@ -506,7 +517,7 @@ function tryMountUI() {
         return;
     }
 
-    // 1. 顶栏指示器（根据 showInTopBar 开关决定是否挂载）
+    // 1. 顶栏指示器
     if (settings && settings.showInTopBar) {
         if ($('#omni_tracker_topbar_btn').length === 0) {
             const btnHtml = `
@@ -524,10 +535,9 @@ function tryMountUI() {
 
             $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
 
-            // 右键或长按提示快捷隐藏
             $('#omni_tracker_topbar_btn').on('contextmenu', function (e) {
                 e.preventDefault();
-                if (confirm('是否隐藏顶栏快捷指示器？\n（隐藏后顶部更清爽，可随时在右侧扩展列表中重新打开或查看看板）')) {
+                if (confirm('是否隐藏顶栏快捷指示器？\n（可随时在右侧扩展列表中重新开启）')) {
                     settings.showInTopBar = false;
                     safeSaveSettings();
                     $('#omni_tracker_topbar_btn').remove();
@@ -539,7 +549,6 @@ function tryMountUI() {
         $('#omni_tracker_topbar_btn').remove();
     }
 
-    // 2. 挂载侧边栏设置抽屉（永久保留）
     mountExtensionSettingsDrawer();
     updateTopBarUI();
 }
@@ -559,7 +568,7 @@ function mountExtensionSettingsDrawer() {
                 </div>
                 <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.25); border-radius: 6px;">
                     <p style="font-size:12px; color:#cbd5e1; margin-bottom: 12px; line-height: 1.5;">
-                        底层透明监听：正文主聊、记忆/SP数据库、TTS语音朗读、小白盒脚本、向量检索等全部 API 消耗。
+                        双层哨兵透明监听：正文主聊、记忆/SP数据库、TTS语音朗读、小白盒脚本、向量检索等全部 API 消耗。
                     </p>
 
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding:8px 10px; background:rgba(255,255,255,0.05); border-radius:6px;">
@@ -627,8 +636,8 @@ function showDashboardModal() {
                 </div>
                 <div class="omni-tabs">
                     <button class="omni-tab-btn active" data-tab="overview">📊 概览</button>
-                    <button class="omni-tab-btn" data-tab="logs">📜 实时流水</button>
-                    <button class="omni-tab-btn" data-tab="models">🤖 模型分布</button>
+                    <button class="omni-tab-btn" data-tab="logs">📜 流水</button>
+                    <button class="omni-tab-btn" data-tab="models">🤖 模型</button>
                     <button class="omni-tab-btn" data-tab="settings">⚙️ 设置</button>
                 </div>
                 <div class="omni-tab-panel" id="omni_tab_content">
@@ -669,7 +678,6 @@ function renderDashboardUI(activeTab) {
         const session = settings.session;
         const total = settings.totals;
 
-        // 计算分类百分比
         const catTotal = Math.max(1, Object.values(settings.byCategory).reduce((acc, c) => acc + (c.total_tokens || 0), 0));
 
         let activeCatsHtml = '';
@@ -842,7 +850,6 @@ function renderDashboardUI(activeTab) {
             </div>
         `);
 
-        // 弹窗内开关事件
         $('#omni_modal_toggle_topbar').on('change', function () {
             const isChecked = $(this).prop('checked');
             settings.showInTopBar = isChecked;
