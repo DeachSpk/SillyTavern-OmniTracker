@@ -1,9 +1,9 @@
 /**
- * Omni API Tracker for SillyTavern (v1.5.0 通用模型账本版)
+ * Omni API Tracker for SillyTavern (v1.5.1 生成端点纯净化版)
  * 以模型资产为中心（Model-First），通用无遗漏审计 + 冒险者公会手账
  * 
  * @author ymf2317-tech & @黎吧啦
- * @version 1.5.0
+ * @version 1.5.1
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
@@ -346,7 +346,8 @@ function extractOutputText(data) {
 }
 
 /**
- * 通用宽进拦截探针：捕获所有大模型与向量/语音相关的网络调用
+ * 通用精准拦截探针：只拦截真正的 LLM 生成与向量/语音端点
+ * 彻底剔除酒馆内部的 /process(正则修剪)、/status(探活)、/bias(偏置)、/plugins(插件存储) 等纯数据传输
  */
 function isTargetLLMApi(url, options) {
     if (!url) return false;
@@ -356,26 +357,47 @@ function isTargetLLMApi(url, options) {
     else if (url && url.url) urlStr = url.url;
     urlStr = urlStr.toLowerCase();
 
-    // 1. 常见 API 路由特征（不限制域名，完全兼容本地/反代/自建端点）
-    if (urlStr.includes('/chat/completions') ||
-        urlStr.includes('/completions') ||
-        urlStr.includes('/generate') ||
-        urlStr.includes('/embeddings') ||
-        urlStr.includes('/embed') ||
-        urlStr.includes('/rerank') ||
-        urlStr.includes('/audio/speech') ||
-        urlStr.includes('/tts') ||
-        urlStr.includes('/api/backends/') ||
+    // 1. 坚决排除内部辅助/数据传输路由（绝非大模型调用）
+    if (urlStr.includes('/chat-completions/process') ||
+        urlStr.includes('/chat-completions/bias') ||
+        urlStr.includes('/chat-completions/status') ||
+        urlStr.includes('/tokenizers/') ||
+        urlStr.includes('/token-count') ||
+        urlStr.includes('/api/chats/') ||
         urlStr.includes('/api/plugins/')) {
+        return false;
+    }
+
+    // 2. 酒馆官方生成出口（唯一的真实生成通道）
+    if (urlStr.includes('/api/backends/chat-completions/generate') ||
+        urlStr.includes('/api/backends/text-completions/generate') ||
+        urlStr.includes('/api/backends/kobold/generate') ||
+        urlStr.includes('/api/novelai/generate')) {
         return true;
     }
 
-    // 2. 检查 Request body 是否明显是 LLM 请求
-    if (options && options.body && typeof options.body === 'string') {
-        const bodyPreview = options.body.slice(0, 300);
-        if (bodyPreview.includes('"messages"') || bodyPreview.includes('"prompt"') || bodyPreview.includes('"input"')) {
-            return true;
-        }
+    // 3. 外部直连大模型标准生成端点（狐裁、独立中转、第三方 API）
+    if (urlStr.includes('/chat/completions') ||
+        urlStr.endsWith('/completions') ||
+        urlStr.includes('/completions?') ||
+        urlStr.includes('/v1/models')) {
+        // 排除纯列表查询
+        if (urlStr.includes('/models')) return false;
+        return true;
+    }
+
+    // 4. 向量嵌入与 Rerank 精排端点（狐忆、玄狐台、Ollama、自建 /embed）
+    if (urlStr.includes('/embeddings') ||
+        urlStr.includes('/embed/') ||
+        urlStr.includes('/rerank')) {
+        return true;
+    }
+
+    // 5. 语音合成 (TTS)
+    if (urlStr.includes('/audio/speech') ||
+        urlStr.includes('/api/backends/tts') ||
+        urlStr.includes('/tts')) {
+        return true;
     }
 
     return false;
