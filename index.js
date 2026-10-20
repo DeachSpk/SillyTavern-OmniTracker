@@ -1,9 +1,9 @@
 /**
- * Omni API Tracker for SillyTavern (v1.4.1 渠道指纹精准归因版)
- * 融合双层哨兵流量审计 + 黎吧啦活跃时长心跳与 RPG 冒险者陪伴手账
+ * Omni API Tracker for SillyTavern (v1.5.0 通用模型账本版)
+ * 以模型资产为中心（Model-First），通用无遗漏审计 + 冒险者公会手账
  * 
  * @author ymf2317-tech & @黎吧啦
- * @version 1.4.1
+ * @version 1.5.0
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
@@ -11,7 +11,7 @@ import { extension_settings } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'st-omni-api-tracker';
 const LEGACY_USAGE_KEY = 'st_usage_tracker_local';
-const HEARTBEAT_INTERVAL = 15000; // 15秒心跳检测
+const HEARTBEAT_INTERVAL = 15000; // 15秒活跃心跳
 
 // --- 顶层状态机哨兵（捕获酒馆官方生成生命周期）---
 let currentGenerationState = {
@@ -25,7 +25,7 @@ if (typeof eventSource !== 'undefined' && typeof event_types !== 'undefined') {
         eventSource.on(event_types.GENERATION_STARTED, (type, params, dryRun) => {
             if (dryRun) return;
             currentGenerationState.isGenerating = true;
-            currentGenerationState.type = type || 'normal';
+            currentGenerationState.type = (typeof type === 'string') ? type.toLowerCase() : 'normal';
             currentGenerationState.startTime = Date.now();
         });
 
@@ -88,6 +88,14 @@ const RPG_CONFIG = {
     ]
 };
 
+// 4大客观通道定义（放之四海而皆准，不依赖具体插件名）
+const CATEGORY_MAP = {
+    chat: { label: '主聊对话', color: '#38bdf8', icon: 'fa-comment-dots' },
+    scripts: { label: '扩展/预设/后台', color: '#f59e0b', icon: 'fa-bolt' },
+    tts: { label: '语音合成(TTS)', color: '#14b8a6', icon: 'fa-volume-high' },
+    vectors: { label: '向量与重排', color: '#10b981', icon: 'fa-database' },
+};
+
 // 默认存储结构
 const defaultSettings = {
     enabled: true,
@@ -96,18 +104,15 @@ const defaultSettings = {
     today: { date: getTodayDateString(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     session: { startTime: Date.now(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     byCategory: {
-        chat: { label: '正文主聊', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#38bdf8' },
-        memory: { label: '记忆/总结/SP', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#ec4899' },
-        tts: { label: '语音朗读(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' },
-        preset_tools: { label: '预设/工具/脚本', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#f59e0b' },
-        vectors: { label: '向量检索', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#10b981' },
-        other: { label: '其他扩展', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#8b5cf6' },
+        chat: { label: '主聊对话', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#38bdf8' },
+        scripts: { label: '扩展/预设/后台', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#f59e0b' },
+        tts: { label: '语音合成(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' },
+        vectors: { label: '向量与重排', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#10b981' },
     },
-    byModel: {},
+    byModel: {}, // { modelName: { prompt_tokens, completion_tokens, total_tokens, requests, byCategory: { chat: {...}, scripts: {...} } } }
     recentLogs: [],
-    // 活跃时长数据
     activeTime: {
-        daily: {}, // { 'YYYY-MM-DD': milliseconds }
+        daily: {},
         totalMs: 0,
     }
 };
@@ -130,18 +135,19 @@ function loadSettings() {
         }
     }
 
-    if (!settings.byCategory.tts) {
-        settings.byCategory.tts = { label: '语音朗读(TTS)', prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0, color: '#14b8a6' };
+    // 确保 4 大通道存在
+    for (const [ck, cv] of Object.entries(defaultSettings.byCategory)) {
+        if (!settings.byCategory[ck]) {
+            settings.byCategory[ck] = JSON.parse(JSON.stringify(cv));
+        }
     }
 
     if (!settings.activeTime) {
         settings.activeTime = { daily: {}, totalMs: 0 };
     }
 
-    // 自动兼容并迁移黎吧啦旧脚本 (st_usage_tracker_local) 的历史活跃时长
     migrateLegacyActiveTime();
 
-    // 跨天检查
     const today = getTodayDateString();
     if (settings.today.date !== today) {
         settings.today = {
@@ -176,12 +182,11 @@ function migrateLegacyActiveTime() {
                 if (mergedAny) {
                     recalculateTotalActiveMs();
                     safeSaveSettings();
-                    console.log('[OmniTracker] 已成功融合历史活跃时长数据！');
                 }
             }
         }
     } catch (e) {
-        console.warn('[OmniTracker] Legacy time migration check:', e);
+        console.warn('[OmniTracker] Legacy time migration:', e);
     }
 }
 
@@ -205,7 +210,7 @@ function formatTokens(num) {
     if (!num) return '0';
     if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
     if (num >= 1000) return (num / 1000).toFixed(1) + 'k';
-    return num.toLocaleString();
+    return Number(num).toLocaleString();
 }
 
 function msToHourMin(ms) {
@@ -221,9 +226,7 @@ function formatDuration(ms) {
     return `${minutes}m`;
 }
 
-/**
- * 活跃时长心跳累加器
- */
+// --- 活跃时长心跳 ---
 let isWindowActive = true;
 window.addEventListener('focus', () => { isWindowActive = true; });
 window.addEventListener('blur', () => { isWindowActive = false; });
@@ -238,7 +241,6 @@ function addActiveDuration(ms) {
     settings.activeTime.daily[today] += ms;
     settings.activeTime.totalMs = (settings.activeTime.totalMs || 0) + ms;
 
-    // 同步写入 localStorage 双重保险
     try {
         localStorage.setItem(LEGACY_USAGE_KEY, JSON.stringify(settings.activeTime.daily));
     } catch (_) {}
@@ -247,7 +249,6 @@ function addActiveDuration(ms) {
     updateTopBarUI();
 }
 
-// 启动 15 秒心跳定时器
 setInterval(() => {
     if (isWindowActive && !document.hidden) {
         addActiveDuration(HEARTBEAT_INTERVAL);
@@ -255,7 +256,7 @@ setInterval(() => {
 }, HEARTBEAT_INTERVAL);
 
 /**
- * 现代大模型高精度分词估算器（对齐 BPE / cl100k / DeepSeek 真实词元压缩比）
+ * 现代大模型高精度分词估算器（BPE/cl100k 标准）
  */
 function estimateTokens(text) {
     if (!text || typeof text !== 'string') return 0;
@@ -267,32 +268,40 @@ function estimateTokens(text) {
 }
 
 /**
- * 识别大模型与 TTS API 目标
+ * 通用多层模型探测器：从各种可能的载荷路径中挖出真实的模型名
  */
-/**
- * 多层模型探测器：从请求体的各个可能路径里挖出真实模型名
- * 预设脚本的请求结构五花八门，顶层没有 model 是常态
- */
-function extractModelName(obj) {
-    if (!obj || typeof obj !== 'object') return '';
-    const candidates = [
-        obj.model,
-        obj.generate_data && obj.generate_data.model,
-        obj.api && obj.api.model,
-        obj.overrides && obj.overrides.model,
-        obj.settings && obj.settings.model,
-        obj.request && obj.request.model,
-        obj.payload && obj.payload.model,
-        obj.body && obj.body.model,
-    ];
-    for (const c of candidates) {
-        if (typeof c === 'string' && c.trim()) return c.trim();
+function extractModelName(obj, url) {
+    if (obj && typeof obj === 'object') {
+        const candidates = [
+            obj.model,
+            obj.model_name,
+            obj.engine,
+            obj.generate_data?.model,
+            obj.api?.model,
+            obj.overrides?.model,
+            obj.settings?.model,
+            obj.request?.model,
+            obj.payload?.model,
+            obj.body?.model,
+        ];
+        for (const c of candidates) {
+            if (typeof c === 'string' && c.trim()) return c.trim();
+        }
     }
+
+    if (url) {
+        try {
+            const urlObj = new URL(url, 'http://dummy.local');
+            const mParam = urlObj.searchParams.get('model');
+            if (mParam) return mParam.trim();
+        } catch (_) {}
+    }
+
     return '';
 }
 
 /**
- * 统一 Token 用量解析：兼容 OpenAI / Claude / Gemini / 各类中转站的字段差异
+ * 统一 Token 用量解析（兼容 OpenAI/Claude/Gemini/Ollama）
  */
 function applyUsageFrom(trackerItem, usageObj) {
     if (!usageObj || typeof usageObj !== 'object') return false;
@@ -307,7 +316,7 @@ function applyUsageFrom(trackerItem, usageObj) {
 }
 
 /**
- * 统一输出文本提取：兼容 chat / text / claude / gemini / 裸字段
+ * 统一提取输出文本
  */
 function extractOutputText(data) {
     if (!data || typeof data !== 'object') return '';
@@ -336,171 +345,86 @@ function extractOutputText(data) {
     return '';
 }
 
-function isTargetLLMApi(url) {
+/**
+ * 通用宽进拦截探针：捕获所有大模型与向量/语音相关的网络调用
+ */
+function isTargetLLMApi(url, options) {
     if (!url) return false;
     let urlStr = '';
     if (typeof url === 'string') urlStr = url;
     else if (url instanceof URL) urlStr = url.href;
     else if (url && url.url) urlStr = url.url;
+    urlStr = urlStr.toLowerCase();
 
-    if (!urlStr) return false;
-
-    if (urlStr.includes('/api/backends/chat-completions') ||
-        urlStr.includes('/api/backends/text-completions') ||
-        urlStr.includes('/api/backends/embeddings') ||
-        urlStr.includes('/api/backends/tts') ||
+    // 1. 常见 API 路由特征（不限制域名，完全兼容本地/反代/自建端点）
+    if (urlStr.includes('/chat/completions') ||
+        urlStr.includes('/completions') ||
+        urlStr.includes('/generate') ||
+        urlStr.includes('/embeddings') ||
+        urlStr.includes('/embed') ||
+        urlStr.includes('/rerank') ||
+        urlStr.includes('/audio/speech') ||
+        urlStr.includes('/tts') ||
+        urlStr.includes('/api/backends/') ||
         urlStr.includes('/api/plugins/')) {
         return true;
     }
 
-    if (urlStr.includes('/v1/chat/completions') ||
-        urlStr.includes('/v1/completions') ||
-        urlStr.includes('/v1/embeddings') ||
-        urlStr.includes('/v1/audio/speech') ||
-        urlStr.includes('/audio/speech')) {
-        return true;
+    // 2. 检查 Request body 是否明显是 LLM 请求
+    if (options && options.body && typeof options.body === 'string') {
+        const bodyPreview = options.body.slice(0, 300);
+        if (bodyPreview.includes('"messages"') || bodyPreview.includes('"prompt"') || bodyPreview.includes('"input"')) {
+            return true;
+        }
     }
 
     return false;
 }
 
 /**
- * 双层哨兵归因算法
+ * 客观轻量归因（4大通道，不硬编码具体插件名）
  */
 function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
     const s = (stack || '').toLowerCase();
     const u = (url || '').toLowerCase();
     const m = (modelName || '').toLowerCase();
 
-    // 1. 优先级最高：TTS 语音朗读
-    const isTTS = m.includes('tts') ||
-        m.includes('mimo') ||
-        m.includes('voice') ||
-        m.includes('speech') ||
-        u.includes('/audio/') ||
-        u.includes('/tts') ||
-        s.includes('tts') ||
-        s.includes('mimo');
-
-    if (isTTS) {
-        let caller = 'TTS语音';
-        if (m.includes('mimo') || s.includes('mimo')) caller = 'MiMo-TTS';
-        else if (m.includes('edge')) caller = 'Edge-TTS';
-        return { category: 'tts', caller };
+    // 1. 语音合成 (TTS)
+    if (m.includes('tts') || m.includes('mimo') || m.includes('voice') || m.includes('speech') || u.includes('/audio/') || u.includes('/tts')) {
+        return { category: 'tts', caller: '语音合成' };
     }
 
-    // 2. 向量嵌入检索
-    if (u.includes('/embeddings') || m.includes('embed') || s.includes('vectors') || s.includes('chroma')) {
-        return { category: 'vectors', caller: '向量检索' };
+    // 2. 向量检索与重排 (Embeddings / Rerank)
+    if (u.includes('/embeddings') || u.includes('/embed') || u.includes('/rerank') || m.includes('embed') || m.includes('rerank')) {
+        let caller = '向量检索';
+        if (u.includes('/rerank') || m.includes('rerank')) caller = 'Rerank重排';
+        else if (u.includes('/embed') || m.includes('embed')) caller = 'Embedding嵌入';
+        return { category: 'vectors', caller };
     }
 
-    // ============================================================
-    // 3. 通道指纹判定（v1.4.1 核心修复）
-    //    优先级远高于"是否处于生成周期"，彻底解决预设被误算进正文的问题
-    //    - 官方生成通道会在请求体带 type：normal/regenerate/swipe/continue/impersonate → 真正文
-    //                                              quiet → 后台静默
-    //    - 第三方扩展直连 ChatCompletionService 时通常没有 type 字段
-    // ============================================================
+    // 3. 官方主聊正文判断（严格凭证：官方请求体 type）
     const reqType = (typeof reqBodyParsed?.type === 'string') ? reqBodyParsed.type.toLowerCase() : '';
-
     const MAIN_CHAT_TYPES = ['normal', 'regenerate', 'swipe', 'continue', 'impersonate', 'first_message'];
 
-    const isBackgroundBridge = s.includes('call-generate-service') ||
-        s.includes('custom-request.js') ||
-        s.includes('chatcompletionservice.sendrequest');
-
-    const isMemoryStack = s.includes('smart-context') ||
-        s.includes('extensions/memory') ||
-        s.includes('/memory/') ||
-        s.includes('sp_database') ||
-        s.includes('sp-database') ||
-        s.includes('sqlite') ||
-        s.includes('supermemory') ||
-        s.includes('summar');
-
-    const isPresetStack = s.includes('st-prompt-template') ||
-        s.includes('prompt-template') ||
-        s.includes('ruby') ||
-        s.includes('translate') ||
-        s.includes('caption') ||
-        s.includes('js-slash-runner') ||
-        s.includes('slash-commands') ||
-        s.includes('littlewhitebox') ||
-        s.includes('xiaobai');
-
-    // 3.1 官方主聊通道：请求体明确标注主聊 → 正文（即使被小白X/SlashRunner 套了马甲也算正文）
     if (MAIN_CHAT_TYPES.includes(reqType)) {
-        let caller = '主聊正文';
-        if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '正文 (经小白X)';
-        else if (s.includes('js-slash-runner')) caller = '正文 (经SlashRunner)';
-        else if (s.includes('st-prompt-template') || s.includes('prompt-template')) caller = '正文 (经提示词模板)';
-        return { category: 'chat', caller };
+        return { category: 'chat', caller: '主聊对话' };
     }
 
-    // 3.2 官方静默通道 quiet：先分辨是"预设脚本借用静默通道"还是"真正的记忆/总结"
-    if (reqType === 'quiet' || isMemoryStack) {
-        // 预设类扩展借用 quiet 通道时，仍归入预设，绝不污染记忆分类
-        if (isPresetStack && !isMemoryStack) {
-            let pCaller = '预设/工具(quiet)';
-            if (s.includes('st-prompt-template') || s.includes('prompt-template')) pCaller = '提示词模板(quiet)';
-            else if (s.includes('ruby')) pCaller = 'RUBY(quiet)';
-            else if (s.includes('call-generate-service') || s.includes('littlewhitebox') || s.includes('xiaobai')) pCaller = '小白X(quiet)';
-            else if (s.includes('js-slash-runner')) pCaller = 'Slash宏脚本(quiet)';
-            return { category: 'preset_tools', caller: pCaller };
-        }
-        let caller = '后台静默(quiet)';
-        if (s.includes('sp_database') || s.includes('sp-database') || s.includes('sqlite')) caller = 'SP数据库/助手';
-        else if (s.includes('smart-context')) caller = 'Smart-Context';
-        else if (s.includes('extensions/memory')) caller = 'ST原生记忆';
-        else if (s.includes('summar')) caller = '自动总结';
-        else if (isMemoryStack) caller = '记忆/总结';
-        return { category: 'memory', caller };
-    }
+    // 4. 其余所有的 LLM 调用，客观归入“扩展/预设/后台”
+    // （包括狐裁、狐忆逻辑、小白盒、预设宏、世界书、翻译、自动总结等）
+    let caller = '扩展与预设';
+    if (reqType === 'quiet') caller = '后台静默(quiet)';
+    else if (s.includes('slash')) caller = 'Slash命令/宏';
+    else if (s.includes('prompt-template')) caller = '提示词模板';
+    else if (s.includes('call-generate-service')) caller = '预设生成服务';
+    else if (s.includes('translate')) caller = '翻译工具';
+    else if (s.includes('summary') || s.includes('summar')) caller = '文本摘要';
 
-    // 3.3 第三方扩展桥接直连（小白X 后台生成 / 提示词模板 / RUBY / 斜杠脚本等）
-    if (isBackgroundBridge || isPresetStack) {
-        let caller = '预设/工具';
-        if (s.includes('call-generate-service')) caller = '小白X(后台生成)';
-        else if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '小白X(工具/意图)';
-        else if (s.includes('st-prompt-template') || s.includes('prompt-template')) caller = '提示词模板';
-        else if (s.includes('ruby')) caller = 'RUBY';
-        else if (s.includes('js-slash-runner')) caller = 'Slash宏脚本';
-        else if (s.includes('slash-commands')) caller = 'Slash命令';
-        else if (s.includes('translate')) caller = '翻译扩展';
-        else if (s.includes('caption')) caller = '图像描述';
-        return { category: 'preset_tools', caller };
-    }
-
-    // 3.4 无任何指纹的裸请求：才退回启发式判定
-    const messages = reqBodyParsed?.messages;
-    const isMultiTurn = Array.isArray(messages) && messages.length > 1;
-    const promptLen = typeof reqBodyParsed?.prompt === 'string' ? reqBodyParsed.prompt.length : 0;
-
-    if (isStream && isMultiTurn) {
-        return { category: 'chat', caller: '主聊正文(启发式)' };
-    }
-
-    if (isMultiTurn || promptLen > 500) {
-        return { category: 'preset_tools', caller: '未知扩展(长上下文)' };
-    }
-
-    // 3.5 兜底：若确实处于官方主聊周期内
-    if (currentGenerationState.isGenerating &&
-        (currentGenerationState.type === 'normal' || currentGenerationState.type === 'impersonate' || currentGenerationState.type === 'continue')) {
-        return { category: 'chat', caller: '主聊正文(周期)' };
-    }
-
-    // 6. 提取未知名第三方扩展
-    const match = s.match(/extensions\/third-party\/([a-zA-Z0-9_-]+)/i);
-    if (match && match[1]) {
-        return { category: 'other', caller: match[1] };
-    }
-
-    return { category: 'other', caller: '未知来源' };
+    return { category: 'scripts', caller };
 }
 
 /**
- * 记录统计并持久化
+ * 记录用量并持久化
  */
 function recordApiUsage(item) {
     if (!settings || !settings.enabled) return;
@@ -529,21 +453,41 @@ function recordApiUsage(item) {
     settings.session.total_tokens += tTokens;
     settings.session.requests += 1;
 
-    const cat = settings.byCategory[item.category] || settings.byCategory.other;
+    // 通道统计
+    const cat = settings.byCategory[item.category] || settings.byCategory.scripts;
     cat.prompt_tokens += pTokens;
     cat.completion_tokens += cTokens;
     cat.total_tokens += tTokens;
     cat.requests += 1;
 
+    // 模型统计（核心：支持模型内部细分通道）
     const mName = item.model || 'Unknown';
     if (!settings.byModel[mName]) {
-        settings.byModel[mName] = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 };
+        settings.byModel[mName] = {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            requests: 0,
+            byCategory: {},
+        };
     }
-    settings.byModel[mName].prompt_tokens += pTokens;
-    settings.byModel[mName].completion_tokens += cTokens;
-    settings.byModel[mName].total_tokens += tTokens;
-    settings.byModel[mName].requests += 1;
+    const mObj = settings.byModel[mName];
+    mObj.prompt_tokens += pTokens;
+    mObj.completion_tokens += cTokens;
+    mObj.total_tokens += tTokens;
+    mObj.requests += 1;
 
+    if (!mObj.byCategory) mObj.byCategory = {};
+    if (!mObj.byCategory[item.category]) {
+        mObj.byCategory[item.category] = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 };
+    }
+    const mCat = mObj.byCategory[item.category];
+    mCat.prompt_tokens += pTokens;
+    mCat.completion_tokens += cTokens;
+    mCat.total_tokens += tTokens;
+    mCat.requests += 1;
+
+    // 实时流水
     const logEntry = {
         id: Date.now() + Math.random().toString(36).substring(2, 6),
         time: new Date().toLocaleTimeString(),
@@ -570,7 +514,7 @@ function recordApiUsage(item) {
 }
 
 /**
- * 安装底层 Fetch 代理
+ * 全局 Fetch 代理拦截器
  */
 function installFetchHook() {
     const originalFetch = window.fetch;
@@ -579,7 +523,7 @@ function installFetchHook() {
         const url = args[0];
         const options = args[1] || {};
 
-        if (!isTargetLLMApi(url)) {
+        if (!isTargetLLMApi(url, options)) {
             return originalFetch.apply(this, args);
         }
 
@@ -588,8 +532,8 @@ function installFetchHook() {
             model: 'Unknown',
             prompt_tokens: 0,
             completion_tokens: 0,
-            category: 'chat',
-            caller: 'Main Chat',
+            category: 'scripts',
+            caller: '未知任务',
             is_stream: false,
             duration_ms: 0,
         };
@@ -602,11 +546,11 @@ function installFetchHook() {
             if (reqBody && typeof reqBody === 'string') {
                 try {
                     parsedReq = JSON.parse(reqBody);
-                    const detectedModel = extractModelName(parsedReq);
+                    const detectedModel = extractModelName(parsedReq, trackerItem.url);
                     if (detectedModel) trackerItem.model = detectedModel;
-                    trackerItem.req_type = (typeof parsedReq.type === 'string') ? parsedReq.type : '';
                     trackerItem.is_stream = !!parsedReq.stream;
 
+                    // 估算输入 Token 兜底
                     if (Array.isArray(parsedReq.messages)) {
                         let combinedText = '';
                         for (const m of parsedReq.messages) {
@@ -626,7 +570,7 @@ function installFetchHook() {
             trackerItem.category = classification.category;
             trackerItem.caller = classification.caller;
         } catch (prepErr) {
-            console.warn('[OmniTracker] Trace error (ignorable):', prepErr);
+            console.warn('[OmniTracker] Request inspect error:', prepErr);
         }
 
         triggerTopBarPulse();
@@ -640,7 +584,13 @@ function installFetchHook() {
 
         try {
             if (response && response.ok) {
-                if (trackerItem.is_stream && response.body && typeof response.body.tee === 'function') {
+                // 稳健判流：结合 Content-Type 与 请求参数
+                const contentType = (response.headers?.get('content-type') || '').toLowerCase();
+                const isSSE = contentType.includes('text/event-stream') || trackerItem.is_stream;
+
+                if (isSSE && response.body && typeof response.body.tee === 'function') {
+                    // 流式响应 (SSE)：利用 body.tee() 镜像旁路分流
+                    trackerItem.is_stream = true;
                     const [streamMain, streamTracker] = response.body.tee();
                     consumeStreamForMetrics(streamTracker, trackerItem, startTime);
 
@@ -650,32 +600,40 @@ function installFetchHook() {
                         headers: response.headers,
                     });
                 } else {
+                    // 非流式响应：使用 text() 兜底读取，绝不发生 SyntaxError
                     trackerItem.duration_ms = Math.round(performance.now() - startTime);
                     const cloned = response.clone();
 
-                    cloned.json().then(data => {
-                        // 1) 从返回体补齐真实模型
-                        if ((!trackerItem.model || trackerItem.model === 'Unknown') && data && typeof data.model === 'string' && data.model.trim()) {
-                            trackerItem.model = data.model.trim();
-                        }
+                    cloned.text().then(rawText => {
+                        try {
+                            const data = JSON.parse(rawText);
+                            // 1. 尝试从返回体补齐模型
+                            const respModel = extractModelName(data);
+                            if ((!trackerItem.model || trackerItem.model === 'Unknown') && respModel) {
+                                trackerItem.model = respModel;
+                            }
 
-                        // 2) 合并所有可能的 usage 位置
-                        let usageHit = false;
-                        if (data && typeof data === 'object') {
-                            usageHit = applyUsageFrom(trackerItem, data.usage)
-                                || applyUsageFrom(trackerItem, data.usageMetadata)
-                                || applyUsageFrom(trackerItem, data.usage_metadata)
-                                || applyUsageFrom(trackerItem, data.message && data.message.usage);
-                        }
+                            // 2. 提取 usage 字段
+                            let hitUsage = false;
+                            if (data && typeof data === 'object') {
+                                hitUsage = applyUsageFrom(trackerItem, data.usage)
+                                    || applyUsageFrom(trackerItem, data.usageMetadata)
+                                    || applyUsageFrom(trackerItem, data.usage_metadata);
+                            }
 
-                        // 3) 没有官方 usage 就用文本兜底估算
-                        if (!usageHit) {
-                            const outText = extractOutputText(data);
-                            if (outText) trackerItem.completion_tokens = estimateTokens(outText);
+                            // 3. 兜底提取输出文本算 Token
+                            if (!hitUsage) {
+                                const outText = extractOutputText(data);
+                                if (outText) trackerItem.completion_tokens = estimateTokens(outText);
+                            }
+                        } catch (_) {
+                            // 返回体不是 JSON（可能是纯文本），直接文本估算，绝不记 0
+                            if (rawText && rawText.length > 0 && !contentType.includes('audio')) {
+                                trackerItem.completion_tokens = estimateTokens(rawText);
+                            }
                         }
                         recordApiUsage(trackerItem);
                     }).catch(() => {
-                        // 非 JSON 响应（音频/纯文本等）
                         recordApiUsage(trackerItem);
                     });
                 }
@@ -687,7 +645,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 流量审计与冒险者公会手账已就绪 (v1.4.1)');
+    console.log('[OmniTracker] 通用模型账本拦截器已就绪 (v1.5.0)');
 }
 
 async function consumeStreamForMetrics(stream, trackerItem, startTime) {
@@ -715,16 +673,17 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
                 try {
                     const parsed = JSON.parse(dataStr);
 
-                    // 从流式分片里补齐真实模型名（最可靠的一手证据）
+                    // 1. 从流式分片里补齐真实模型名（上游一手证据）
                     if ((!trackerItem.model || trackerItem.model === 'Unknown') && typeof parsed.model === 'string' && parsed.model.trim()) {
                         trackerItem.model = parsed.model.trim();
                     }
 
-                    // 合并各类 usage 字段
+                    // 2. 合并流式 usage
                     if (parsed.usage) officialUsage = parsed.usage;
                     else if (parsed.usageMetadata) officialUsage = parsed.usageMetadata;
                     else if (parsed.usage_metadata) officialUsage = parsed.usage_metadata;
 
+                    // 3. 拼接文本
                     const chunk = parsed.choices?.[0]?.delta?.content
                         || parsed.choices?.[0]?.text
                         || parsed.delta
@@ -752,9 +711,7 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
     }
 }
 
-/**
- * 挂载 UI 元素
- */
+// --- UI 挂载与渲染 ---
 function tryMountUI() {
     if (!window.$) {
         setTimeout(tryMountUI, 300);
@@ -764,7 +721,7 @@ function tryMountUI() {
     if (settings && settings.showInTopBar) {
         if ($('#omni_tracker_topbar_btn').length === 0) {
             const btnHtml = `
-                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击查看看板 (长按可隐藏)">
+                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击打开通用模型账本 (长按可隐藏)">
                     <i class="fa-solid fa-bolt"></i>
                     <span id="omni_tracker_topbar_text">0</span>
                 </div>
@@ -806,12 +763,12 @@ function mountExtensionSettingsDrawer() {
         <div id="omni_tracker_extension_settings" class="extension_container">
             <div class="inline-drawer">
                 <div class="inline-drawer-toggle inline-drawer-header">
-                    <b><i class="fa-solid fa-bolt" style="color:#34d399;"></i> Omni 审计与冒险者公会手账</b>
+                    <b><i class="fa-solid fa-bolt" style="color:#34d399;"></i> Omni 通用模型账本与公会手账</b>
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content" style="padding: 12px; background: rgba(0,0,0,0.25); border-radius: 6px;">
                     <p style="font-size:12px; color:#cbd5e1; margin-bottom: 12px; line-height: 1.5;">
-                        双层哨兵全量监听（正文/记忆/TTS/预设）；内置冒险者公会活跃时长、RPG等级与成就图鉴。
+                        通用全量监听：分模型清晰核算主聊对话、预设/后台脚本、TTS语音、向量检索；内置冒险者公会活跃手账。
                     </p>
 
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding:8px 10px; background:rgba(255,255,255,0.05); border-radius:6px;">
@@ -824,7 +781,7 @@ function mountExtensionSettingsDrawer() {
 
                     <div style="display:flex; gap:10px;">
                         <button class="menu_button" id="omni_open_dashboard_from_settings">
-                            <i class="fa-solid fa-chart-pie"></i> 打开审计与公会看板
+                            <i class="fa-solid fa-chart-pie"></i> 打开通用模型账本
                         </button>
                     </div>
                 </div>
@@ -864,7 +821,6 @@ function updateTopBarUI() {
     const todayMs = settings.activeTime?.daily?.[today] || 0;
     const timeStr = formatDuration(todayMs);
 
-    // 胶囊显示：Token + 时长
     $('#omni_tracker_topbar_text').text(`${tokenStr} | ${timeStr}`);
 }
 
@@ -879,18 +835,16 @@ function showDashboardModal() {
         <div id="omni_tracker_modal" class="omni-modal-overlay">
             <div class="omni-modal-content">
                 <div class="omni-modal-header">
-                    <h3><i class="fa-solid fa-shield-halved" style="color:#34d399;"></i> Omni 流量审计与冒险者公会</h3>
-                    <button class="omni-close-btn" id="omni_close_modal_btn" title="关闭看板"><i class="fa-solid fa-xmark"></i></button>
+                    <h3><i class="fa-solid fa-cube" style="color:#34d399;"></i> Omni 通用模型账本</h3>
+                    <button class="omni-close-btn" id="omni_close_modal_btn" title="关闭"><i class="fa-solid fa-xmark"></i></button>
                 </div>
                 <div class="omni-tabs">
-                    <button class="omni-tab-btn active" data-tab="overview">📊 用量概览</button>
+                    <button class="omni-tab-btn active" data-tab="models">🤖 模型总览</button>
                     <button class="omni-tab-btn" data-tab="rpg">🏰 陪伴手账</button>
                     <button class="omni-tab-btn" data-tab="logs">📜 实时流水</button>
-                    <button class="omni-tab-btn" data-tab="models">🤖 模型分布</button>
                     <button class="omni-tab-btn" data-tab="settings">⚙️ 设置维护</button>
                 </div>
                 <div class="omni-tab-panel" id="omni_tab_content">
-                    <!-- 动态渲染 -->
                 </div>
             </div>
         </div>
@@ -911,92 +865,116 @@ function showDashboardModal() {
         renderDashboardUI($(this).data('tab'));
     });
 
-    renderDashboardUI('overview');
+    renderDashboardUI('models');
 }
 
 function renderDashboardUI(activeTab) {
     if (!activeTab) {
-        activeTab = $('.omni-tab-btn.active').data('tab') || 'overview';
+        activeTab = $('.omni-tab-btn.active').data('tab') || 'models';
     }
 
     const $panel = $('#omni_tab_content');
     if (!settings) return;
 
-    if (activeTab === 'overview') {
+    if (activeTab === 'models') {
+        // --- 🤖 模型总览（Model-First，核心大账本）---
         const today = settings.today;
-        const session = settings.session;
         const total = settings.totals;
-        const todayDate = getTodayDateString();
-        const todayActiveMs = settings.activeTime?.daily?.[todayDate] || 0;
-        const totalActiveMs = settings.activeTime?.totalMs || 0;
+        const todayActiveMs = settings.activeTime?.daily?.[getTodayDateString()] || 0;
 
-        const catTotal = Math.max(1, Object.values(settings.byCategory).reduce((acc, c) => acc + (c.total_tokens || 0), 0));
+        const models = settings.byModel || {};
+        const mKeys = Object.keys(models).sort((a, b) => (models[b].total_tokens || 0) - (models[a].total_tokens || 0));
 
-        let activeCatsHtml = '';
-        let zeroCatsHtml = '';
+        let modelCardsHtml = '';
+        if (mKeys.length === 0) {
+            modelCardsHtml = '<div style="text-align:center; padding: 40px 20px; color:#94a3b8; font-size:13px;">暂无模型调用数据。开始对话或触发预设后将在此呈现。</div>';
+        } else {
+            const grandTotalTokens = Math.max(1, mKeys.reduce((acc, k) => acc + (models[k].total_tokens || 0), 0));
 
-        for (const [key, cat] of Object.entries(settings.byCategory)) {
-            const hasUsage = (cat.requests > 0 || cat.total_tokens > 0);
-            const pct = hasUsage ? ((cat.total_tokens / catTotal) * 100).toFixed(1) : '0.0';
+            for (const m of mKeys) {
+                const data = models[m];
+                const modelTotal = Math.max(1, data.total_tokens || 0);
+                const shareOfAll = ((data.total_tokens || 0) / grandTotalTokens * 100).toFixed(1);
 
-            const cardHtml = `
-                <div class="omni-category-card ${hasUsage ? '' : 'is-zero'}">
-                    <div class="omni-category-info">
-                        <div class="omni-category-name">
-                            <span>${cat.label}</span>
-                            <span class="omni-category-calls">(${cat.requests}次调用)</span>
+                const catMap = data.byCategory || {};
+                const catEntries = Object.entries(catMap).sort((a, b) => (b[1].total_tokens || 0) - (a[1].total_tokens || 0));
+
+                let segsHtml = '';
+                let rowsHtml = '';
+
+                if (catEntries.length === 0) {
+                    rowsHtml = '<div style="font-size:11px; color:#94a3b8; padding:6px 0;">（新发起的调用将在此清晰展示主聊 vs 预设比例）</div>';
+                }
+
+                for (const [ck, cv] of catEntries) {
+                    const meta = CATEGORY_MAP[ck] || { label: ck, color: '#8b5cf6', icon: 'fa-cube' };
+                    const pct = ((cv.total_tokens || 0) / modelTotal) * 100;
+                    if (pct <= 0 && cv.requests <= 0) continue;
+
+                    segsHtml += `<div style="width:${Math.max(2, pct)}%; background:${meta.color};" title="${meta.label}: ${pct.toFixed(1)}%"></div>`;
+                    rowsHtml += `
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px; padding:6px 0; border-top:1px dashed #26263a;">
+                            <span style="color:#e2e8f0; flex:1; white-space:nowrap; display:flex; align-items:center; gap:6px;">
+                                <i class="fa-solid ${meta.icon}" style="color:${meta.color};"></i>
+                                <strong>${meta.label}</strong>
+                            </span>
+                            <span style="color:#94a3b8; white-space:nowrap;">${cv.requests}次 · 入 ${formatTokens(cv.prompt_tokens)} / 出 ${formatTokens(cv.completion_tokens)}</span>
+                            <span style="color:#f8fafc; font-weight:700; white-space:nowrap; min-width:80px; text-align:right;">
+                                ${formatTokens(cv.total_tokens)} <span style="color:${meta.color}; font-size:10px;">${pct.toFixed(1)}%</span>
+                            </span>
                         </div>
-                        <div class="omni-category-stats">
-                            <span>${formatTokens(cat.total_tokens)}</span>
-                            <span class="omni-category-pct">(${pct}%)</span>
+                    `;
+                }
+
+                modelCardsHtml += `
+                    <div class="omni-category-card" style="padding:12px 14px; margin-bottom:12px;">
+                        <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
+                            <span style="font-weight:800; color:#38bdf8; font-size:14px; word-break:break-all;">
+                                <i class="fa-solid fa-microchip" style="margin-right:6px; color:#34d399;"></i>${m}
+                            </span>
+                            <span style="color:#34d399; font-weight:800; font-size:14px; white-space:nowrap;">${formatTokens(data.total_tokens)}</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between; font-size:11px; color:#94a3b8; margin-bottom:8px;">
+                            <span>共调用 ${data.requests} 次 (入 ${formatTokens(data.prompt_tokens)} / 出 ${formatTokens(data.completion_tokens)})</span>
+                            <span>占总用量 ${shareOfAll}%</span>
+                        </div>
+                        <div style="display:flex; height:7px; border-radius:4px; overflow:hidden; background:#0f0f17; border:1px solid #222232;">
+                            ${segsHtml}
+                        </div>
+                        <div style="margin-top:8px;">
+                            ${rowsHtml}
                         </div>
                     </div>
-                    <div class="omni-progress-bg">
-                        <div class="omni-progress-bar" style="width: ${hasUsage ? pct : 0}%; background: ${cat.color};"></div>
-                    </div>
-                </div>
-            `;
-
-            if (hasUsage) {
-                activeCatsHtml += cardHtml;
-            } else {
-                zeroCatsHtml += cardHtml;
+                `;
             }
         }
 
         $panel.html(`
             <div class="omni-stat-grid">
                 <div class="omni-stat-card">
-                    <div class="omni-stat-title">今日总消耗</div>
+                    <div class="omni-stat-title">今日总用量</div>
                     <div class="omni-stat-value">${formatTokens(today.total_tokens)}</div>
-                    <div class="omni-stat-sub">入: ${formatTokens(today.prompt_tokens)} | 出: ${formatTokens(today.completion_tokens)}</div>
+                    <div class="omni-stat-sub">${today.requests} 次交互 (入 ${formatTokens(today.prompt_tokens)} / 出 ${formatTokens(today.completion_tokens)})</div>
                 </div>
                 <div class="omni-stat-card">
                     <div class="omni-stat-title">今日活跃时长</div>
                     <div class="omni-stat-value" style="color:#fbbf24 !important;">${formatDuration(todayActiveMs)}</div>
-                    <div class="omni-stat-sub">累计投入: ${formatDuration(totalActiveMs)}</div>
+                    <div class="omni-stat-sub">累计投入: ${formatDuration(settings.activeTime?.totalMs || 0)}</div>
                 </div>
                 <div class="omni-stat-card">
-                    <div class="omni-stat-title">本次会话</div>
-                    <div class="omni-stat-value" style="color:#60a5fa !important;">${formatTokens(session.total_tokens)}</div>
-                    <div class="omni-stat-sub">${session.requests} 次 API 调用</div>
+                    <div class="omni-stat-title">历史累计消耗</div>
+                    <div class="omni-stat-value" style="color:#c084fc !important;">${formatTokens(total.total_tokens)}</div>
+                    <div class="omni-stat-sub">总计 ${total.requests} 次调用</div>
                 </div>
             </div>
 
-            <div class="omni-section-title"><i class="fa-solid fa-layer-group" style="color:#38bdf8;"></i> 产生消耗的模块</div>
-            <div>
-                ${activeCatsHtml || '<div style="color:#94a3b8; font-size:12px; padding:10px 0;">暂无活跃模块消耗记录</div>'}
+            <div class="omni-section-title">
+                <i class="fa-solid fa-cubes-stacked" style="color:#38bdf8;"></i> 模型用量明细 (按模型归集，清晰展示主聊与预设比例)
             </div>
-
-            ${zeroCatsHtml ? `
-                <div class="omni-section-title" style="margin-top:20px; font-size:12px; color:#94a3b8 !important;">
-                    <i class="fa-solid fa-minus"></i> 未产生调用的模块 (未开启或无请求)
-                </div>
-                <div>${zeroCatsHtml}</div>
-            ` : ''}
+            ${modelCardsHtml}
         `);
     } else if (activeTab === 'rpg') {
-        // --- 🏰 陪伴手账（RPG冒险者公会）---
+        // --- 🏰 陪伴手账 ---
         const daily = settings.activeTime?.daily || {};
         const entries = Object.keys(daily).map(d => ({
             date: d,
@@ -1107,20 +1085,19 @@ function renderDashboardUI(activeTab) {
     } else if (activeTab === 'logs') {
         const logs = settings.recentLogs || [];
         if (logs.length === 0) {
-            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、或触发记忆/TTS后台脚本时将在此实时显示。</div>');
+            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无调用记录。与酒馆对话、或触发预设/TTS时将在此实时显示。</div>');
             return;
         }
 
         let rowsHtml = '';
         for (const log of logs) {
-            const badgeClass = `omni-badge-${log.category || 'other'}`;
-            const catLabel = settings.byCategory[log.category]?.label?.split('/')[0] || log.category;
+            const catMeta = CATEGORY_MAP[log.category] || { label: log.category, color: '#8b5cf6' };
             rowsHtml += `
                 <tr>
                     <td style="color:#94a3b8;">${log.time}</td>
-                    <td><span class="omni-badge ${badgeClass}">${catLabel}</span></td>
+                    <td><span class="omni-badge omni-badge-${log.category || 'scripts'}">${catMeta.label}</span></td>
                     <td style="color:#f8fafc; font-weight:600; max-width:130px; overflow:hidden; text-overflow:ellipsis;">${log.caller || '-'}</td>
-                    <td style="color:#38bdf8; max-width:140px; overflow:hidden; text-overflow:ellipsis;">${log.model || '-'}</td>
+                    <td style="color:#38bdf8; max-width:150px; overflow:hidden; text-overflow:ellipsis;" title="${log.model}">${log.model || '-'}</td>
                     <td>${formatTokens(log.prompt_tokens)}</td>
                     <td>${formatTokens(log.completion_tokens)}</td>
                     <td style="font-weight:700; color:#34d399;">${formatTokens(log.total_tokens)}</td>
@@ -1135,8 +1112,8 @@ function renderDashboardUI(activeTab) {
                     <thead>
                         <tr>
                             <th>时间</th>
-                            <th>归属</th>
-                            <th>发起来源</th>
+                            <th>通道</th>
+                            <th>任务说明</th>
                             <th>模型</th>
                             <th>Prompt</th>
                             <th>Completion</th>
@@ -1147,44 +1124,6 @@ function renderDashboardUI(activeTab) {
                     <tbody>
                         ${rowsHtml}
                     </tbody>
-                </table>
-            </div>
-        `);
-    } else if (activeTab === 'models') {
-        const models = settings.byModel || {};
-        const mKeys = Object.keys(models);
-        if (mKeys.length === 0) {
-            $panel.html('<div style="text-align:center; padding: 50px 20px; color:#94a3b8; font-size:13px;">暂无模型调用数据。</div>');
-            return;
-        }
-
-        let rows = '';
-        for (const m of mKeys) {
-            const data = models[m];
-            rows += `
-                <tr>
-                    <td style="font-weight:700; color:#38bdf8;">${m}</td>
-                    <td>${data.requests} 次</td>
-                    <td>${formatTokens(data.prompt_tokens)}</td>
-                    <td>${formatTokens(data.completion_tokens)}</td>
-                    <td style="font-weight:700; color:#34d399;">${formatTokens(data.total_tokens)}</td>
-                </tr>
-            `;
-        }
-
-        $panel.html(`
-            <div class="omni-table-wrap">
-                <table class="omni-log-table">
-                    <thead>
-                        <tr>
-                            <th>模型标识</th>
-                            <th>调用次数</th>
-                            <th>输入 Token</th>
-                            <th>输出 Token</th>
-                            <th>总计 Token</th>
-                        </tr>
-                    </thead>
-                    <tbody>${rows}</tbody>
                 </table>
             </div>
         `);
@@ -1244,7 +1183,6 @@ function renderDashboardUI(activeTab) {
             if (window.toastr) toastr.success('今日用量统计已重置');
         });
 
-        // 导出 JSON
         $('#omni_btn_export_json').on('click', () => {
             const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify(settings, null, 2));
             const dlAnchor = document.createElement('a');
@@ -1253,7 +1191,6 @@ function renderDashboardUI(activeTab) {
             dlAnchor.click();
         });
 
-        // 导入 JSON（兼容 Omni 完整备份与黎吧啦活跃时长 JSON）
         $('#omni_btn_import_trigger').on('click', () => $('#omni_file_input').click());
         $('#omni_file_input').on('change', function (e) {
             const file = e.target.files[0];
