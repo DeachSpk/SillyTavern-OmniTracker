@@ -1,9 +1,9 @@
 /**
- * Omni API Tracker for SillyTavern (v1.4.0 冒险者公会与全量审计合体版)
+ * Omni API Tracker for SillyTavern (v1.4.1 渠道指纹精准归因版)
  * 融合双层哨兵流量审计 + 黎吧啦活跃时长心跳与 RPG 冒险者陪伴手账
  * 
  * @author ymf2317-tech & @黎吧啦
- * @version 1.4.0
+ * @version 1.4.1
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
@@ -269,6 +269,73 @@ function estimateTokens(text) {
 /**
  * 识别大模型与 TTS API 目标
  */
+/**
+ * 多层模型探测器：从请求体的各个可能路径里挖出真实模型名
+ * 预设脚本的请求结构五花八门，顶层没有 model 是常态
+ */
+function extractModelName(obj) {
+    if (!obj || typeof obj !== 'object') return '';
+    const candidates = [
+        obj.model,
+        obj.generate_data && obj.generate_data.model,
+        obj.api && obj.api.model,
+        obj.overrides && obj.overrides.model,
+        obj.settings && obj.settings.model,
+        obj.request && obj.request.model,
+        obj.payload && obj.payload.model,
+        obj.body && obj.body.model,
+    ];
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim()) return c.trim();
+    }
+    return '';
+}
+
+/**
+ * 统一 Token 用量解析：兼容 OpenAI / Claude / Gemini / 各类中转站的字段差异
+ */
+function applyUsageFrom(trackerItem, usageObj) {
+    if (!usageObj || typeof usageObj !== 'object') return false;
+
+    const pIn = usageObj.prompt_tokens ?? usageObj.input_tokens ?? usageObj.promptTokenCount ?? usageObj.prompt_token_count;
+    const cOut = usageObj.completion_tokens ?? usageObj.output_tokens ?? usageObj.candidatesTokenCount ?? usageObj.candidates_token_count;
+
+    let hit = false;
+    if (typeof pIn === 'number' && pIn > 0) { trackerItem.prompt_tokens = pIn; hit = true; }
+    if (typeof cOut === 'number' && cOut > 0) { trackerItem.completion_tokens = cOut; hit = true; }
+    return hit;
+}
+
+/**
+ * 统一输出文本提取：兼容 chat / text / claude / gemini / 裸字段
+ */
+function extractOutputText(data) {
+    if (!data || typeof data !== 'object') return '';
+
+    const candidates = [
+        data?.choices?.[0]?.message?.content,
+        data?.choices?.[0]?.text,
+        data?.choices?.[0]?.delta?.content,
+        data?.message?.content,
+        data?.content?.[0]?.text,
+        data?.content,
+        data?.candidates?.[0]?.content?.parts?.[0]?.text,
+        data?.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join(''),
+        data?.output_text,
+        data?.response,
+        data?.text,
+    ];
+
+    for (const c of candidates) {
+        if (typeof c === 'string' && c.trim()) return c;
+        if (Array.isArray(c)) {
+            const joined = c.map(x => (typeof x === 'string' ? x : '')).join('');
+            if (joined.trim()) return joined;
+        }
+    }
+    return '';
+}
+
 function isTargetLLMApi(url) {
     if (!url) return false;
     let urlStr = '';
@@ -327,57 +394,100 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'vectors', caller: '向量检索' };
     }
 
-    // 3. 正文主聊判定（剥离套娃马甲）
-    const isNormalCycle = (currentGenerationState.isGenerating &&
-        (currentGenerationState.type === 'normal' || currentGenerationState.type === 'impersonate' || currentGenerationState.type === 'continue'));
+    // ============================================================
+    // 3. 通道指纹判定（v1.4.1 核心修复）
+    //    优先级远高于"是否处于生成周期"，彻底解决预设被误算进正文的问题
+    //    - 官方生成通道会在请求体带 type：normal/regenerate/swipe/continue/impersonate → 真正文
+    //                                              quiet → 后台静默
+    //    - 第三方扩展直连 ChatCompletionService 时通常没有 type 字段
+    // ============================================================
+    const reqType = (typeof reqBodyParsed?.type === 'string') ? reqBodyParsed.type.toLowerCase() : '';
 
-    const messages = reqBodyParsed?.messages;
-    const isMultiTurn = Array.isArray(messages) && messages.length > 1;
-    const promptLen = typeof reqBodyParsed?.prompt === 'string' ? reqBodyParsed.prompt.length : 0;
+    const MAIN_CHAT_TYPES = ['normal', 'regenerate', 'swipe', 'continue', 'impersonate', 'first_message'];
 
-    if (isNormalCycle || isStream || isMultiTurn || promptLen > 500) {
-        let caller = '主聊正文';
-        if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '正文 (经小白盒)';
-        else if (s.includes('js-slash-runner') || s.includes('slash')) caller = '正文 (经SlashRunner)';
-        return { category: 'chat', caller };
-    }
+    const isBackgroundBridge = s.includes('call-generate-service') ||
+        s.includes('custom-request.js') ||
+        s.includes('chatcompletionservice.sendrequest');
 
-    // 4. 记忆与长程数据库类
-    const isMemoryRelated = (currentGenerationState.type === 'quiet' && (s.includes('memory') || s.includes('summary'))) ||
-        s.includes('smart-context') ||
+    const isMemoryStack = s.includes('smart-context') ||
         s.includes('extensions/memory') ||
         s.includes('/memory/') ||
         s.includes('sp_database') ||
         s.includes('sp-database') ||
-        s.includes('database') ||
         s.includes('sqlite') ||
-        s.includes('assistant') ||
         s.includes('supermemory') ||
-        s.includes('summarize');
+        s.includes('summar');
 
-    if (isMemoryRelated) {
-        let caller = '记忆/总结';
-        if (s.includes('sp') || s.includes('database')) caller = 'SP数据库/助手';
+    const isPresetStack = s.includes('st-prompt-template') ||
+        s.includes('prompt-template') ||
+        s.includes('ruby') ||
+        s.includes('translate') ||
+        s.includes('caption') ||
+        s.includes('js-slash-runner') ||
+        s.includes('slash-commands') ||
+        s.includes('littlewhitebox') ||
+        s.includes('xiaobai');
+
+    // 3.1 官方主聊通道：请求体明确标注主聊 → 正文（即使被小白X/SlashRunner 套了马甲也算正文）
+    if (MAIN_CHAT_TYPES.includes(reqType)) {
+        let caller = '主聊正文';
+        if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '正文 (经小白X)';
+        else if (s.includes('js-slash-runner')) caller = '正文 (经SlashRunner)';
+        else if (s.includes('st-prompt-template') || s.includes('prompt-template')) caller = '正文 (经提示词模板)';
+        return { category: 'chat', caller };
+    }
+
+    // 3.2 官方静默通道 quiet：先分辨是"预设脚本借用静默通道"还是"真正的记忆/总结"
+    if (reqType === 'quiet' || isMemoryStack) {
+        // 预设类扩展借用 quiet 通道时，仍归入预设，绝不污染记忆分类
+        if (isPresetStack && !isMemoryStack) {
+            let pCaller = '预设/工具(quiet)';
+            if (s.includes('st-prompt-template') || s.includes('prompt-template')) pCaller = '提示词模板(quiet)';
+            else if (s.includes('ruby')) pCaller = 'RUBY(quiet)';
+            else if (s.includes('call-generate-service') || s.includes('littlewhitebox') || s.includes('xiaobai')) pCaller = '小白X(quiet)';
+            else if (s.includes('js-slash-runner')) pCaller = 'Slash宏脚本(quiet)';
+            return { category: 'preset_tools', caller: pCaller };
+        }
+        let caller = '后台静默(quiet)';
+        if (s.includes('sp_database') || s.includes('sp-database') || s.includes('sqlite')) caller = 'SP数据库/助手';
         else if (s.includes('smart-context')) caller = 'Smart-Context';
         else if (s.includes('extensions/memory')) caller = 'ST原生记忆';
+        else if (s.includes('summar')) caller = '自动总结';
+        else if (isMemoryStack) caller = '记忆/总结';
         return { category: 'memory', caller };
     }
 
-    // 5. 预设、工具、单句小脚本
-    if (s.includes('littlewhitebox') || s.includes('xiaobai')) {
-        return { category: 'preset_tools', caller: '小白盒(工具/意图)' };
+    // 3.3 第三方扩展桥接直连（小白X 后台生成 / 提示词模板 / RUBY / 斜杠脚本等）
+    if (isBackgroundBridge || isPresetStack) {
+        let caller = '预设/工具';
+        if (s.includes('call-generate-service')) caller = '小白X(后台生成)';
+        else if (s.includes('littlewhitebox') || s.includes('xiaobai')) caller = '小白X(工具/意图)';
+        else if (s.includes('st-prompt-template') || s.includes('prompt-template')) caller = '提示词模板';
+        else if (s.includes('ruby')) caller = 'RUBY';
+        else if (s.includes('js-slash-runner')) caller = 'Slash宏脚本';
+        else if (s.includes('slash-commands')) caller = 'Slash命令';
+        else if (s.includes('translate')) caller = '翻译扩展';
+        else if (s.includes('caption')) caller = '图像描述';
+        return { category: 'preset_tools', caller };
     }
-    if (s.includes('st-prompt-template')) {
-        return { category: 'preset_tools', caller: '预设模板' };
+
+    // 3.4 无任何指纹的裸请求：才退回启发式判定
+    const messages = reqBodyParsed?.messages;
+    const isMultiTurn = Array.isArray(messages) && messages.length > 1;
+    const promptLen = typeof reqBodyParsed?.prompt === 'string' ? reqBodyParsed.prompt.length : 0;
+
+    if (isStream && isMultiTurn) {
+        return { category: 'chat', caller: '主聊正文(启发式)' };
     }
-    if (s.includes('translate')) {
-        return { category: 'preset_tools', caller: '翻译扩展' };
+
+    if (isMultiTurn || promptLen > 500) {
+        return { category: 'preset_tools', caller: '未知扩展(长上下文)' };
     }
-    if (s.includes('caption')) {
-        return { category: 'preset_tools', caller: '图像描述' };
-    }
-    if (s.includes('js-slash-runner') || s.includes('slash')) {
-        return { category: 'preset_tools', caller: 'Slash宏脚本' };
+
+    // 3.5 兜底：若确实处于官方主聊周期内
+    if (currentGenerationState.isGenerating &&
+        (currentGenerationState.type === 'normal' || currentGenerationState.type === 'impersonate' || currentGenerationState.type === 'continue')) {
+        return { category: 'chat', caller: '主聊正文(周期)' };
     }
 
     // 6. 提取未知名第三方扩展
@@ -386,7 +496,7 @@ function classifyRequest(stack, url, reqBodyParsed, isStream, modelName) {
         return { category: 'other', caller: match[1] };
     }
 
-    return { category: 'chat', caller: '主聊管道' };
+    return { category: 'other', caller: '未知来源' };
 }
 
 /**
@@ -492,7 +602,9 @@ function installFetchHook() {
             if (reqBody && typeof reqBody === 'string') {
                 try {
                     parsedReq = JSON.parse(reqBody);
-                    trackerItem.model = parsedReq.model || trackerItem.model;
+                    const detectedModel = extractModelName(parsedReq);
+                    if (detectedModel) trackerItem.model = detectedModel;
+                    trackerItem.req_type = (typeof parsedReq.type === 'string') ? parsedReq.type : '';
                     trackerItem.is_stream = !!parsedReq.stream;
 
                     if (Array.isArray(parsedReq.messages)) {
@@ -542,15 +654,28 @@ function installFetchHook() {
                     const cloned = response.clone();
 
                     cloned.json().then(data => {
-                        if (data && data.usage) {
-                            trackerItem.prompt_tokens = data.usage.prompt_tokens ?? trackerItem.prompt_tokens;
-                            trackerItem.completion_tokens = data.usage.completion_tokens ?? 0;
-                        } else {
-                            const outText = data?.choices?.[0]?.message?.content || data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                        // 1) 从返回体补齐真实模型
+                        if ((!trackerItem.model || trackerItem.model === 'Unknown') && data && typeof data.model === 'string' && data.model.trim()) {
+                            trackerItem.model = data.model.trim();
+                        }
+
+                        // 2) 合并所有可能的 usage 位置
+                        let usageHit = false;
+                        if (data && typeof data === 'object') {
+                            usageHit = applyUsageFrom(trackerItem, data.usage)
+                                || applyUsageFrom(trackerItem, data.usageMetadata)
+                                || applyUsageFrom(trackerItem, data.usage_metadata)
+                                || applyUsageFrom(trackerItem, data.message && data.message.usage);
+                        }
+
+                        // 3) 没有官方 usage 就用文本兜底估算
+                        if (!usageHit) {
+                            const outText = extractOutputText(data);
                             if (outText) trackerItem.completion_tokens = estimateTokens(outText);
                         }
                         recordApiUsage(trackerItem);
                     }).catch(() => {
+                        // 非 JSON 响应（音频/纯文本等）
                         recordApiUsage(trackerItem);
                     });
                 }
@@ -562,7 +687,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 流量审计与冒险者公会手账已就绪 (v1.4.0)');
+    console.log('[OmniTracker] 流量审计与冒险者公会手账已就绪 (v1.4.1)');
 }
 
 async function consumeStreamForMetrics(stream, trackerItem, startTime) {
@@ -589,11 +714,23 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 
                 try {
                     const parsed = JSON.parse(dataStr);
-                    if (parsed.usage) {
-                        officialUsage = parsed.usage;
+
+                    // 从流式分片里补齐真实模型名（最可靠的一手证据）
+                    if ((!trackerItem.model || trackerItem.model === 'Unknown') && typeof parsed.model === 'string' && parsed.model.trim()) {
+                        trackerItem.model = parsed.model.trim();
                     }
-                    const chunk = parsed.choices?.[0]?.delta?.content || parsed.candidates?.[0]?.content?.parts?.[0]?.text;
-                    if (chunk) {
+
+                    // 合并各类 usage 字段
+                    if (parsed.usage) officialUsage = parsed.usage;
+                    else if (parsed.usageMetadata) officialUsage = parsed.usageMetadata;
+                    else if (parsed.usage_metadata) officialUsage = parsed.usage_metadata;
+
+                    const chunk = parsed.choices?.[0]?.delta?.content
+                        || parsed.choices?.[0]?.text
+                        || parsed.delta
+                        || parsed.candidates?.[0]?.content?.parts?.[0]?.text
+                        || parsed.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('');
+                    if (typeof chunk === 'string' && chunk) {
                         accumulatedText += chunk;
                     }
                 } catch (_) {}
@@ -603,10 +740,11 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
     } finally {
         trackerItem.duration_ms = Math.round(performance.now() - startTime);
 
+        let usageHit = false;
         if (officialUsage) {
-            if (officialUsage.prompt_tokens !== undefined) trackerItem.prompt_tokens = officialUsage.prompt_tokens;
-            if (officialUsage.completion_tokens !== undefined) trackerItem.completion_tokens = officialUsage.completion_tokens;
-        } else {
+            usageHit = applyUsageFrom(trackerItem, officialUsage);
+        }
+        if (!usageHit) {
             trackerItem.completion_tokens = estimateTokens(accumulatedText);
         }
 

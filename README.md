@@ -5,7 +5,7 @@
 **酒馆全量 API 审计与冒险者公会手账**  
 *Full-Spectrum API Call Tracker & Adventurer Guild Companion for SillyTavern*
 
-[![Version](https://img.shields.io/badge/version-v1.4.0-emerald.svg)](https://github.com/ymf2317-tech/SillyTavern-OmniTracker)
+[![Version](https://img.shields.io/badge/version-v1.4.1-emerald.svg)](https://github.com/ymf2317-tech/SillyTavern-OmniTracker)
 [![SillyTavern](https://img.shields.io/badge/SillyTavern-Extension-blue.svg)](https://github.com/SillyTavern/SillyTavern)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 
@@ -24,7 +24,7 @@
 
 现有统计插件大多依赖聊天框的“消息渲染事件”，导致后台静默发起的 **Smart Context（上下文浓缩）**、**SP 数据库 / 记忆库**、**自动总结（Summarize）**、**LittlewhiteBox（小白盒意图判断）**、**JS-Slash-Runner 宏脚本** 以及 **TTS 语音朗读** 被 100% 漏报！
 
-**Omni API Tracker v1.4.0 带来了终极合体解决方案**：
+**Omni API Tracker v1.4.1 带来了终极合体解决方案**：
 1. **双层哨兵流量审计**：
    - **上层业务哨兵**：接入酒馆官方生成生命周期（`normal` vs `quiet`），彻底穿透小白盒、Slash-Runner 等拦截器的“套娃马甲”，还聊天正文以清白！
    - **底层网络哨兵**：全局代理 `window.fetch`，利用 `ReadableStream.tee()` 无损镜像打字机流，0 延迟、0 阻塞捕获发往大模型或音频端点的真实 Usage！
@@ -83,7 +83,7 @@ git clone https://github.com/ymf2317-tech/SillyTavern-OmniTracker.git
 
 Most token counters in the SillyTavern ecosystem rely solely on UI message rendering events (`MESSAGE_RECEIVED`). This leaves silent background calls from **Smart Context**, **Memory/Summarization**, **SP Databases**, **LittlewhiteBox / Preset scripts**, and **TTS models (MiMo, Edge-TTS)** completely unrecorded.
 
-**Omni API Tracker v1.4.0 brings the ultimate combo**:
+**Omni API Tracker v1.4.1 brings the ultimate combo**:
 1. **Two-Tier Sentry Traffic Auditing**:
    - **Upper-Tier Lifecycle Sentinel**: Distinguishes chat turns (`normal`) from background quiet tasks (`quiet`), unwrapping interceptors like Slash-Runner or LittlewhiteBox to correctly attribute dialogue.
    - **Lower-Tier Network Sentinel**: Transparently proxies `window.fetch` and splits SSE streams via `ReadableStream.tee()`, extracting official usage with zero latency and zero interference.
