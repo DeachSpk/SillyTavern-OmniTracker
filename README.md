@@ -2,10 +2,10 @@
 
 # ⚡ Omni API Tracker for SillyTavern
 
-**酒馆全量 API 审计与冒险者公会手账**  
-*Full-Spectrum API Call Tracker & Adventurer Guild Companion for SillyTavern*
+**酒馆通用全量模型账本与冒险者公会手账**  
+*Model-First Universal API Call Tracker & Adventurer Guild Companion for SillyTavern*
 
-[![Version](https://img.shields.io/badge/version-v1.4.1-emerald.svg)](https://github.com/ymf2317-tech/SillyTavern-OmniTracker)
+[![Version](https://img.shields.io/badge/version-v1.5.1-emerald.svg)](https://github.com/ymf2317-tech/SillyTavern-OmniTracker)
 [![SillyTavern](https://img.shields.io/badge/SillyTavern-Extension-blue.svg)](https://github.com/SillyTavern/SillyTavern)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 
@@ -20,17 +20,24 @@
 
 ### 🌟 为什么诞生这个插件？
 
-许多重度折腾酒馆的玩家都遇到过类似困扰：**“中转站余额飞速扣费，但翻看聊天记录，字数根本对不上账？到底有哪几个后台插件在暗中跑大模型？各自烧了多少 Token？今天又在酒馆陪伴了纸片人多久？”**
+许多重度折腾酒馆的玩家都遇到过类似困扰：**“API 额度扣得飞快，但翻看聊天记录，字数根本对不上账？到底有哪几个后台脚本在暗中调模型？各调了什么模型、烧了多少 Token？今天又在酒馆陪伴了纸片人多久？”**
 
-现有统计插件大多依赖聊天框的“消息渲染事件”，导致后台静默发起的 **Smart Context（上下文浓缩）**、**SP 数据库 / 记忆库**、**自动总结（Summarize）**、**LittlewhiteBox（小白盒意图判断）**、**JS-Slash-Runner 宏脚本** 以及 **TTS 语音朗读** 被 100% 漏报！
+现有统计插件大多只能捕获聊天框里的“正文气泡”，导致后台静默发起的各种预设脚本、意图判断、世界书宏、以及 TTS 语音朗读被大量漏报；而粗暴的拦截器又容易误把酒馆本地做文本正则修剪的内部数据传输当成大模型调用，导致账目虚增。
 
-**Omni API Tracker v1.4.1 带来了终极合体解决方案**：
-1. **双层哨兵流量审计**：
-   - **上层业务哨兵**：接入酒馆官方生成生命周期（`normal` vs `quiet`），彻底穿透小白盒、Slash-Runner 等拦截器的“套娃马甲”，还聊天正文以清白！
-   - **底层网络哨兵**：全局代理 `window.fetch`，利用 `ReadableStream.tee()` 无损镜像打字机流，0 延迟、0 阻塞捕获发往大模型或音频端点的真实 Usage！
-2. **冒险者公会陪伴手账（融合 @黎吧啦 活跃心跳与 RPG 成就系统）**：
-   - 15 秒精准心跳感知（页面可见且聚焦才打卡，挂起不虚增时长）；
-   - RPG 10 阶冒险者称号与等级（迷途旅人 ➔ 奇点见证者，带经验进度条）；
+**Omni API Tracker v1.5.1 带来了终极通用解决方案**：
+1. **以模型资产为第一核心（Model-First Universal Ledger）**：
+   - 彻底告别对具体插件名字的死板硬编码，以**客观模型名**为单位建账；
+   - 每一个调用过的模型独立卡片核算，内部清晰展示：`💬 主聊对话` vs `⚡ 扩展/预设/后台` 的比例与消耗，预设是独立配模型还是偷用了主模型，一目了然！
+2. **生成出口纯净化过滤（严防虚假传输）**：
+   - 严格锁定 `/generate`、`/chat/completions`、向量与语音端点；
+   - 坚决剔除酒馆本地的 `/process`（正则修剪）、`/bias`（偏置）、`/status`（探活）以及插件内部存储通道，绝不虚增 1 个 Token！
+3. **彻底根治 Unknown 与 Token 变 0**：
+   - 结合响应头 `Content-Type: text/event-stream` 精准判流；
+   - 非流式读取采用弹性兜底，即使返回纯文本也绝不抛异常进 catch 记 0；
+   - 宽进探针，自建向量端点、小主机 Ollama `11434` 100% 捕获。
+4. **冒险者公会陪伴手账（融合 @黎吧啦 活跃心跳与 RPG 成就系统）**：
+   - 15 秒精准心跳感知（页面可见且聚焦才打卡，锁屏/挂起不虚增时长）；
+   - RPG 10 阶冒险者称号与等级（迷途旅人 ➔ 奇点见证者，10h/级，带金色进度条）；
    - 10 大勋章成就图鉴与历史肝帝 Top 5 排行榜；
    - 原生 SVG 7 天活跃趋势柱状图（零外部 CDN 依赖，离线秒开）。
 
@@ -38,17 +45,17 @@
 
 ### ✨ 核心特性
 
-- 🎯 **四大家族，泾渭分明**：
-  - 💬 **正文主聊**：剥离各种拦截器外壳，还原真正的角色对话消耗；
-  - 🔊 **语音朗读 (TTS)**：**独立专属分类（青绿徽章）**，单独统计 MiMo-TTS、Edge-TTS 等语音调用，不再稀释聊天数据；
-  - 🧠 **记忆/总结/SP**：精准捕获 Smart-Context、SP 数据库、自动摘要等后台浓缩消耗；
-  - ⚙️ **预设/工具/脚本**：统计单句意图判定、模板宏运算与翻译插件开销；
-  - 🔍 **向量检索**：捕获知识库与 Embeddings 向量嵌入计算。
+- 🤖 **模型资产大账本**：打开看板第一眼即见所有模型的调用次数、输入/输出 Token、总消耗及全域占比。
+- 🎯 **4 大客观通用通道**：
+  - 💬 **主聊对话**：聊天框主流程生成；
+  - ⚡ **扩展/预设/后台**：预设脚本、意图分析、总结与后台任务；
+  - 🔊 **语音合成 (TTS)**：独立统计音频生成调用；
+  - 🔍 **向量与重排**：捕获 Embeddings 向量嵌入与 Rerank 计算。
 - 🏰 **RPG 冒险者公会手账**：
   - 在线活跃时长自动按天归档，自动兼容并迁移历史活跃时长数据；
   - 冒险者称号、等级、经验条、成就勋章、肝帝排行榜。
 - 📊 **黑曜石高对比度暗黑 UI**：强制深色卡片（#151520）与纯白加粗字体，告别浅色主题“白底黄字”，移动端与 PC 完美自适应。
-- 📜 **实时调用流水日志**：精确到秒，查看每次请求的发起源、模型名称、Prompt、Completion 与网络耗时（ms）。
+- 📜 **实时调用流水日志**：精确到秒，查看每次请求的时间戳、通道、模型名称、Prompt、Completion 与网络耗时（ms）。
 - ⚡ **顶栏开关自由控制**：顶栏徽章显示 `⚡ Token | 时长`；支持在扩展设置中一键隐藏、或长按徽章快捷隐藏，清爽不遮挡。
 - 🛡️ **100% 零侵入与零残留**：纯前端扩展，不改酒馆任何核心源码，删掉文件夹即彻底恢复。
 
@@ -81,35 +88,23 @@ git clone https://github.com/ymf2317-tech/SillyTavern-OmniTracker.git
 
 ### 🌟 Why Omni API Tracker?
 
-Most token counters in the SillyTavern ecosystem rely solely on UI message rendering events (`MESSAGE_RECEIVED`). This leaves silent background calls from **Smart Context**, **Memory/Summarization**, **SP Databases**, **LittlewhiteBox / Preset scripts**, and **TTS models (MiMo, Edge-TTS)** completely unrecorded.
+Most token counters in the SillyTavern ecosystem only capture dialogue bubbles rendered into the chat box, missing asynchronous background calls from preset scripts, intent extractors, auto-summaries, and TTS speech synthesis. Conversely, naive fetch interceptors often mistakenly count local prompt post-processing transfers (`/process`) as model generations, artificially inflating prompt usage.
 
-**Omni API Tracker v1.4.1 brings the ultimate combo**:
-1. **Two-Tier Sentry Traffic Auditing**:
-   - **Upper-Tier Lifecycle Sentinel**: Distinguishes chat turns (`normal`) from background quiet tasks (`quiet`), unwrapping interceptors like Slash-Runner or LittlewhiteBox to correctly attribute dialogue.
-   - **Lower-Tier Network Sentinel**: Transparently proxies `window.fetch` and splits SSE streams via `ReadableStream.tee()`, extracting official usage with zero latency and zero interference.
-2. **Adventurer Guild Active Companion**:
-   - 15-second visibility-aware heartbeat tracking (only ticks when the tab is focused and active);
+**Omni API Tracker v1.5.1 delivers the universal solution**:
+1. **Model-First Universal Ledger**:
+   - Abandons brittle hardcoded extension name heuristics; accounts by objective model entities.
+   - Each model gets a dedicated dashboard card detailing the breakdown between `💬 Main Chat` and `⚡ Extensions/Presets/Background`. Instantly reveals whether a preset is using an independent model or consuming your main chat quota.
+2. **Strict Generation Endpoint Filtering**:
+   - Only intercepts authentic generation exits (`/generate`, `/chat/completions`, vector, and audio endpoints).
+   - Firmly excludes internal local text regex formatting (`/process`), token counting (`/tokenizers`), and internal plugin storage routes, preventing fake token inflation.
+3. **Resilient Parsing (Zero Unknown & Zero Token Glitches)**:
+   - Header-aware SSE detection via `Content-Type: text/event-stream`.
+   - Safe `text()` fallback for non-streaming responses, ensuring raw texts or non-standard payloads never throw SyntaxError or record 0 tokens.
+4. **Adventurer Guild Active Companion**:
+   - 15-second visibility-aware heartbeat tracking (only ticks when active and focused);
    - RPG Title & Level Progression (Novice Traveler ➔ Singularity Witness, 10 hours per Level);
    - 10 unlockable achievements and historical Top 5 Marathon sessions;
    - Zero-dependency SVG 7-day activity bar chart (offline-ready).
-
----
-
-### ✨ Key Features
-
-- 🎯 **Accurate Categorization**:
-  - 💬 **Main Chat**: Unwraps extension wrappers and attributes true conversation turns.
-  - 🔊 **Voice Synthesis (TTS)**: Dedicated category for MiMo-TTS, Edge-TTS, and audio generation.
-  - 🧠 **Memory & Summary**: Tracks Smart-Context, SP databases, and auto-summaries.
-  - ⚙️ **Presets & Tools**: Records standalone intent extraction and script macros.
-  - 🔍 **Vector Embeddings**: Tracks knowledge base embedding queries.
-- 🏰 **Adventurer Guild Companion**:
-  - Daily active time accumulation with auto-migration from legacy tracker files;
-  - RPG Titles, Level Progress, Achievement Showcase, and Top 5 Grinder Records.
-- 📊 **Studio Dark High-Contrast Dashboard**: Crafted `#151520` dark studio theme with crisp white typography, immune to theme color glitches.
-- 📜 **Real-time Request Log**: Inspect exact timestamps, caller extensions, model names, prompt/completion tokens, and network latency.
-- ⚡ **Flexible Topbar Pill**: Displays `⚡ Tokens | Duration`; toggle on/off from extension settings or long-press the badge to hide.
-- 🛡️ **Zero Host Mutation**: 100% client-side extension. Zero backend configuration, zero dependencies, completely reversible.
 
 ---
 
@@ -136,4 +131,3 @@ Reload your browser to start auditing!
 
 ## 📄 License
 Released under the [MIT License](LICENSE).
-EOF
