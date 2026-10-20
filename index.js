@@ -1,9 +1,9 @@
 /**
- * Omni API Tracker for SillyTavern (v1.5.1 生成端点纯净化版)
+ * Omni API Tracker for SillyTavern (v1.5.2 智能去水清洗版)
  * 以模型资产为中心（Model-First），通用无遗漏审计 + 冒险者公会手账
  * 
  * @author ymf2317-tech & @黎吧啦
- * @version 1.5.1
+ * @version 1.5.2
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
@@ -190,12 +190,111 @@ function migrateLegacyActiveTime() {
     }
 }
 
-function recalculateTotalActiveMs() {
-    let sum = 0;
-    for (const ms of Object.values(settings.activeTime.daily)) {
-        sum += (ms || 0);
+/**
+ * 智能清洗与去水函数（老用户一键修复旧版误抓产生的虚高数据）
+ * 100% 保留所有真实回复(Completion)、TTS语音、RPG活跃时长与成就
+ */
+function cleanHistoricalWaterData(interactive = true) {
+    if (!settings || !settings.byModel) return;
+
+    let removedFakeModels = [];
+    let adjustedPromptTokens = 0;
+    const bm = settings.byModel;
+
+    // 1. 扫描并清除无任何输出的纯假模型（非 TTS）
+    for (const [m, v] of Object.entries(bm)) {
+        if (m === 'Unknown' || 'tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+        const c = v.completion_tokens || 0;
+        const p = v.prompt_tokens || 0;
+
+        // 如果输出全为 0，且输入大于 0，说明纯属内部数据传输
+        if (c === 0 && p > 0) {
+            removedFakeModels.push(m);
+            delete bm[m];
+        }
     }
-    settings.activeTime.totalMs = sum;
+
+    // 2. 校准被正则修剪严重注水的真实模型（输入输出比畸形 > 60:1）
+    for (const [m, v] of Object.entries(bm)) {
+        if ('tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+        const c = v.completion_tokens || 0;
+        const p = v.prompt_tokens || 0;
+
+        if (c > 0 && p > 0) {
+            const ratio = p / c;
+            // 正常聊天上下文与回复比通常在 10:1 到 35:1 之间，若超过 60:1 说明经历了海量重复 process 注入
+            if (ratio > 60) {
+                // 根据输出字数合理校准真实上下文输入（按 25:1 的重度上下文基准校准）
+                const realisticPrompt = Math.round(c * 25);
+                if (p > realisticPrompt) {
+                    adjustedPromptTokens += (p - realisticPrompt);
+                    v.prompt_tokens = realisticPrompt;
+                    v.total_tokens = realisticPrompt + c;
+                    v.requests = Math.max(1, Math.round(c / 1500)); // 校准真实请求轮次
+
+                    if (v.byCategory && v.byCategory.chat) {
+                        v.byCategory.chat.prompt_tokens = realisticPrompt;
+                        v.byCategory.chat.total_tokens = realisticPrompt + c;
+                        v.byCategory.chat.requests = v.requests;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 清理 recentLogs 中的假记录
+    const oldLogs = settings.recentLogs || [];
+    const cleanLogs = oldLogs.filter(r => (r.completion_tokens > 0 || r.category === 'tts'));
+    settings.recentLogs = cleanLogs;
+
+    // 4. 重新聚合 totals
+    let totP = 0, totC = 0, totReq = 0;
+    for (const v of Object.values(bm)) {
+        totP += (v.prompt_tokens || 0);
+        totC += (v.completion_tokens || 0);
+        totReq += (v.requests || 0);
+    }
+
+    settings.totals = {
+        prompt_tokens: totP,
+        completion_tokens: totC,
+        total_tokens: totP + totC,
+        requests: totReq,
+    };
+
+    // 5. 重新分配 byCategory
+    for (const catKey of Object.keys(settings.byCategory)) {
+        settings.byCategory[catKey].prompt_tokens = 0;
+        settings.byCategory[catKey].completion_tokens = 0;
+        settings.byCategory[catKey].total_tokens = 0;
+        settings.byCategory[catKey].requests = 0;
+    }
+
+    for (const [m, v] of Object.entries(bm)) {
+        const isTTS = 'tts' in m.toLowerCase() || 'mimo' in m.toLowerCase();
+        const catKey = isTTS ? 'tts' : 'chat';
+        const target = settings.byCategory[catKey];
+        target.prompt_tokens += (v.prompt_tokens || 0);
+        target.completion_tokens += (v.completion_tokens || 0);
+        target.total_tokens += (v.total_tokens || 0);
+        target.requests += (v.requests || 0);
+    }
+
+    // 校准 today（防止今日数据仍显示旧的虚高）
+    if (settings.today) {
+        settings.today.prompt_tokens = Math.min(settings.today.prompt_tokens, settings.totals.prompt_tokens);
+        settings.today.completion_tokens = Math.min(settings.today.completion_tokens, settings.totals.completion_tokens);
+        settings.today.total_tokens = settings.today.prompt_tokens + settings.today.completion_tokens;
+    }
+
+    safeSaveSettings();
+    updateTopBarUI();
+
+    return {
+        removedModels: removedFakeModels,
+        cleanedTokens: adjustedPromptTokens,
+        newTotal: settings.totals.total_tokens,
+    };
 }
 
 function safeSaveSettings() {
@@ -1166,6 +1265,7 @@ function renderDashboardUI(activeTab) {
                 <div class="omni-actions" style="margin-top:20px;">
                     <button class="menu_button" id="omni_btn_reset_session"><i class="fa-solid fa-arrows-rotate"></i> 重置本次会话</button>
                     <button class="menu_button" id="omni_btn_reset_today"><i class="fa-solid fa-calendar-xmark"></i> 清空今日统计</button>
+                    <button class="menu_button" id="omni_btn_clean_water" style="background:#065f46 !important; color:#6ee7b7 !important;"><i class="fa-solid fa-broom"></i> 智能去水清洗 (修复旧版虚高)</button>
                     <button class="menu_button" id="omni_btn_export_json"><i class="fa-solid fa-file-export"></i> 导出完整数据 (JSON)</button>
                     <button class="menu_button" id="omni_btn_import_trigger"><i class="fa-solid fa-file-import"></i> 导入数据 (支持旧时长文件)</button>
                     <input type="file" id="omni_file_input" accept=".json" style="display:none;">
@@ -1203,6 +1303,33 @@ function renderDashboardUI(activeTab) {
             renderDashboardUI('settings');
             updateTopBarUI();
             if (window.toastr) toastr.success('今日用量统计已重置');
+        });
+
+        $('#omni_btn_clean_water').on('click', () => {
+            let estimatedWater = 0;
+            const bm = settings.byModel || {};
+            for (const [m, v] of Object.entries(bm)) {
+                if ('tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+                const c = v.completion_tokens || 0;
+                const p = v.prompt_tokens || 0;
+                if (c === 0 && p > 0) estimatedWater += p;
+                else if (c > 0 && p / c > 60) {
+                    estimatedWater += Math.max(0, p - Math.round(c * 25));
+                }
+            }
+
+            if (estimatedWater < 10000) {
+                if (window.toastr) toastr.info('数据非常健康，未检测到异常虚高的注水数据！');
+                return;
+            }
+
+            const waterStr = formatTokens(estimatedWater);
+            if (confirm(`【智能去水清洗诊断】\n\n检测到历史数据存在约 ${waterStr} 的异常注水 Tokens（通常由旧版本误抓酒馆内部正则修剪产生）。\n\n- 保留：全部真实 AI 回复 (Completion)\n- 保留：全部语音朗读 (TTS)\n- 保留：全部 RPG 冒险者时长与成就\n- 剔除：内部数据传输产生的虚高 Prompt\n\n是否立即执行一键去水校准？`)) {
+                const res = cleanHistoricalWaterData();
+                renderDashboardUI('settings');
+                updateTopBarUI();
+                if (window.toastr) toastr.success(`去水成功！已校准约 ${formatTokens(res.cleanedTokens)} 虚高数据，账本已回归真实！`);
+            }
         });
 
         $('#omni_btn_export_json').on('click', () => {
