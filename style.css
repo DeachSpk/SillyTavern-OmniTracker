@@ -1,19 +1,31 @@
-/* Omni API Tracker - SillyTavern Extension Styles (Dark Studio v1.4.0) */
+/* Omni API Tracker - SillyTavern Extension Styles (Dark Studio v1.6.0) */
 
 /* 顶栏小徽章按钮 */
 #omni_tracker_topbar_btn {
-    display: inline-flex;
+    position: fixed !important;
+    z-index: 9998;
+    display: inline-flex !important;
+    flex-direction: row !important;
+    width: max-content !important;
+    min-width: 0 !important;
+    max-width: calc(100vw - 16px);
+    height: auto !important;
+    min-height: 30px;
+    box-sizing: border-box;
+    white-space: nowrap !important;
+    touch-action: none;
+    -webkit-user-select: none;
     align-items: center;
     gap: 6px;
     padding: 3px 10px;
-    margin: 0 4px;
+    margin: 0 !important;
     background: rgba(18, 18, 26, 0.92);
     border: 1px solid rgba(52, 211, 153, 0.45);
     border-radius: 12px;
     font-size: 11px;
     font-weight: 700;
     cursor: pointer;
-    transition: all 0.2s ease-in-out;
+    transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
     user-select: none;
     color: #34d399 !important;
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
@@ -22,8 +34,17 @@
 #omni_tracker_topbar_btn:hover {
     background: rgba(28, 28, 40, 0.95);
     border-color: #34d399;
-    transform: translateY(-1px);
+    transform: none;
     box-shadow: 0 0 10px rgba(52, 211, 153, 0.5);
+}
+
+#omni_tracker_topbar_btn.omni-dragging {
+    cursor: grabbing;
+}
+
+#omni_tracker_topbar_btn:focus-visible {
+    outline: 2px solid #34d399;
+    outline-offset: 3px;
 }
 
 #omni_tracker_topbar_btn.pulse-active {
@@ -128,6 +149,8 @@
 }
 
 .omni-tab-btn {
+    width: auto !important;
+    min-width: max-content;
     padding: 8px 14px;
     background: none;
     border: none;
@@ -439,6 +462,7 @@
     border: 1px solid #28283c;
     border-radius: 8px;
     margin-bottom: 12px;
+    gap: 12px;
 }
 
 .omni-setting-label {
@@ -459,6 +483,7 @@
     width: 44px;
     height: 24px;
     flex-shrink: 0;
+    margin: 0;
 }
 
 .omni-switch input {
@@ -505,4 +530,77 @@
     margin-top: 16px;
     justify-content: flex-start;
     flex-wrap: wrap;
+}
+
+/* Override SillyTavern/theme menu_button sizing only inside this extension. */
+#omni_tracker_extension_settings .omni-actions > .menu_button,
+#omni_tracker_modal .omni-actions > .menu_button {
+    display: inline-flex !important;
+    flex-direction: row !important;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: auto !important;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 36px;
+    height: auto;
+    flex: 0 1 auto;
+    padding: 8px 12px;
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.5;
+    word-break: keep-all !important;
+    overflow-wrap: normal !important;
+    white-space: normal;
+    box-sizing: border-box;
+}
+
+#omni_tracker_extension_settings .omni-action-button {
+    white-space: nowrap !important;
+}
+
+.omni-actions > .menu_button > i {
+    flex-shrink: 0;
+}
+
+.omni-cost {
+    color: #34d399 !important;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.omni-model-cost {
+    color: #34d399;
+    font-size: 12px;
+    margin: 6px 0;
+}
+
+.omni-pricing-note {
+    color: #94a3b8;
+    font-size: 11px;
+    line-height: 1.6;
+    margin-bottom: 14px;
+}
+
+@media (max-width: 600px) {
+    .omni-model-breakdown {
+        flex-wrap: wrap;
+    }
+
+    .omni-model-breakdown > span:first-child {
+        flex-basis: 100% !important;
+    }
+
+    .omni-model-breakdown > span:last-child {
+        margin-left: auto;
+    }
+
+    .omni-modal-header {
+        padding: 12px;
+    }
+
+    .omni-modal-header h3 {
+        font-size: 13px;
+    }
 }

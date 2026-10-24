@@ -5,13 +5,39 @@
 **酒馆通用全量模型账本与冒险者公会手账**  
 *Model-First Universal API Call Tracker & Adventurer Guild Companion for SillyTavern*
 
-[![Version](https://img.shields.io/badge/version-v1.5.2-emerald.svg)](https://github.com/ymf2317-tech/SillyTavern-OmniTracker)
+[![Version](https://img.shields.io/badge/version-v1.6.0-emerald.svg)](https://github.com/DeachSpk/SillyTavern-OmniTracker)
 [![SillyTavern](https://img.shields.io/badge/SillyTavern-Extension-blue.svg)](https://github.com/SillyTavern/SillyTavern)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 
 [**中文说明**](#-中文说明) | [**English Documentation**](#-english-documentation)
 
 </div>
+
+---
+
+## 本 Fork 的改动（v1.6.0）
+
+本项目基于 [ymf2317-tech/SillyTavern-OmniTracker](https://github.com/ymf2317-tech/SillyTavern-OmniTracker)，原作者 **ymf2317-tech**；保留原代码中 **@黎吧啦** 的活跃时长与 RPG 系统署名。本 Fork 由 **DeachSpk** 维护，沿用上游 README 声明的 **MIT License**，完整条款见 [LICENSE](LICENSE)。
+
+- **美元费用**：从 [models.dev](https://models.dev/) 的公开 API 获取单价，在模型总览、通道明细、实时流水和悬浮窗显示估算 USD。价格在浏览器中缓存 24 小时，可在「设置维护」手动刷新；更新失败保留缓存。请求仅拉取公开价格，不上传聊天、用量或 API 密钥。
+- **计价说明**：优先匹配服务商和模型；未知中转采用可识别的原厂参考价。支持输入/输出 Token、响应提供的缓存读写用量与长上下文价格档位。新调用保存匹配时的单价；旧数据及价格加载前的调用按可获得的基础单价回估，无法还原旧调用的缓存或上下文档位。今日旧统计缺少模型信息时显示未计价；历史模型明细可按模型回估。
+- **未计价说明**：无法匹配、价格不可用，以及语音/图片/时长/按次等非文本 Token 计费项目均显示「未计价」，不当作免费。合计有遗漏时标明未计价次数，悬浮窗以 `+` 提示。USD 是参考估算，未包含中转倍率、折扣、税费或额外工具费用，实际支出以服务商账单为准。
+- **悬浮窗**：独立于酒馆顶栏挂载，修复部分主题下不显示的问题。支持鼠标/触屏自由拖动、保存位置、点击或键盘打开账本；扩展设置和维护面板均可切换显示及重置位置。沿用原有暗色和绿色徽章风格，展示「今日 Token | 估算 USD | 活跃时长」。
+- **排版修复**：为扩展按钮限定横排和宽度规则，修复「打开通用模型账本」被主题压成竖排的问题，并适配窄屏。
+
+### 安装本 Fork
+
+在 SillyTavern「扩展 → 安装扩展」中粘贴，分支使用 `main`：
+
+```text
+https://github.com/DeachSpk/SillyTavern-OmniTracker
+```
+
+安装后刷新页面。如果已经安装上游版本，请先停用或移除上游扩展，避免两份插件同时拦截请求；操作前可在「设置维护」导出数据备份。本 Fork 保留原设置键，兼容已有统计与手账数据。
+
+根目录保留 `manifest.json`、`index.js`、`pricing.js`、`style.css`；使用插件不需要 npm 安装或构建。开发验证可运行 `npm ci`、`npm test` 和 `npm run test:browser`（浏览器测试默认使用本机 Chrome；可通过 `OMNI_BROWSER_CHANNEL=msedge` 使用 Edge）。浏览器测试在本地模拟酒馆模块和 API 响应，不调用真实付费模型。
+
+**Fork changes (v1.6.0):** models.dev USD estimates with cached prices, a persistent draggable floating indicator, corrected settings-button layout, and usage parsing for cached/streamed responses. Original project: **ymf2317-tech**; active-time/RPG credit: **@黎吧啦**. Fork maintained by **DeachSpk**, under the upstream-declared **MIT License**. Unmatched/non-token charges are explicitly excluded from estimates. The original documentation follows.
 
 ---
 
@@ -72,14 +98,14 @@
 2. 展开 **“安装扩展”**。
 3. 在 Git 仓库链接输入框中粘贴：
    ```text
-   https://github.com/ymf2317-tech/SillyTavern-OmniTracker
+   https://github.com/DeachSpk/SillyTavern-OmniTracker
    ```
 4. 点击 **“安装 / 保存”**，提示安装成功后在浏览器按 **F5** 刷新页面即可！
 
 #### 方式二：终端直投
 ```bash
 cd SillyTavern/public/scripts/extensions/third-party/
-git clone https://github.com/ymf2317-tech/SillyTavern-OmniTracker.git
+git clone https://github.com/DeachSpk/SillyTavern-OmniTracker.git
 ```
 刷新浏览器即可使用。
 
@@ -117,7 +143,7 @@ Most token counters in the SillyTavern ecosystem only capture dialogue bubbles r
 2. Expand **Install Extension**.
 3. Paste the repository URL:
    ```text
-   https://github.com/ymf2317-tech/SillyTavern-OmniTracker
+   https://github.com/DeachSpk/SillyTavern-OmniTracker
    ```
 4. Click **Install / Save**.
 5. Press **F5** to reload your browser!
@@ -125,7 +151,7 @@ Most token counters in the SillyTavern ecosystem only capture dialogue bubbles r
 #### Method 2: Git Clone
 ```bash
 cd SillyTavern/public/scripts/extensions/third-party/
-git clone https://github.com/ymf2317-tech/SillyTavern-OmniTracker.git
+git clone https://github.com/DeachSpk/SillyTavern-OmniTracker.git
 ```
 Reload your browser to start auditing!
 

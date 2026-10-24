@@ -1,13 +1,15 @@
 /**
- * Omni API Tracker for SillyTavern (v1.5.2 智能去水清洗版)
+ * Omni API Tracker for SillyTavern (v1.6.0 USD & floating indicator)
  * 以模型资产为中心（Model-First），通用无遗漏审计 + 冒险者公会手账
  * 
  * @author ymf2317-tech & @黎吧啦
- * @version 1.5.2
+ * @version 1.6.0
  */
 
 import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
+import { PRICING_URL, PRICE_CACHE_KEY, PRICE_CACHE_TTL, buildCatalog, inferProvider,
+    makeCostBucket, addCostBucket, estimateBucket, summarizeCost, formatUsd, formatCostSummary } from './pricing.js';
 
 const EXTENSION_NAME = 'st-omni-api-tracker';
 const LEGACY_USAGE_KEY = 'st_usage_tracker_local';
@@ -100,6 +102,7 @@ const CATEGORY_MAP = {
 const defaultSettings = {
     enabled: true,
     showInTopBar: true,
+    floatingPosition: null,
     totals: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     today: { date: getTodayDateString(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
     session: { startTime: Date.now(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 },
@@ -118,6 +121,85 @@ const defaultSettings = {
 };
 
 let settings = null;
+let priceCatalog = null;
+let priceUpdatedAt = 0;
+let priceLoading = false;
+let priceError = false;
+
+function escapeHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
+}
+
+function costText(stats, model = '', category = '') {
+    return formatCostSummary(summarizeCost(stats, priceCatalog, model, category));
+}
+
+function historicalCost() {
+    const summary = { usd: 0, priced: 0, unpriced: 0 };
+    for (const [model, usage] of Object.entries(settings.byModel || {})) {
+        const categories = Object.keys(usage.byCategory || {});
+        const category = categories.length === 1 ? categories[0] : '';
+        const cost = summarizeCost(usage, priceCatalog, model, category);
+        summary.usd += cost.usd;
+        summary.priced += cost.priced;
+        summary.unpriced += cost.unpriced;
+    }
+    return summary;
+}
+
+function pricingStatusText() {
+    if (priceLoading) return '正在拉取 models.dev 价格…';
+    if (!priceCatalog) return '价格暂不可用；未匹配的调用不会按免费计算，可在设置维护中重试。';
+    return `${priceError ? '更新失败，沿用缓存；' : ''}价格更新：${new Date(priceUpdatedAt).toLocaleString()} · models.dev`;
+}
+
+async function loadPrices(force = false) {
+    if (priceLoading) return;
+    if (!priceCatalog) {
+        try {
+            const cached = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY));
+            if (cached?.catalog?.entries?.length && Number.isFinite(cached.updatedAt)) {
+                priceCatalog = cached.catalog;
+                priceUpdatedAt = cached.updatedAt;
+            }
+        } catch { /* Browsers may disable storage. */ }
+    }
+    if (!force && priceCatalog && Date.now() - priceUpdatedAt < PRICE_CACHE_TTL) {
+        refreshPriceUI();
+        return;
+    }
+    priceLoading = true;
+    refreshPriceUI();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    try {
+        // Only a public GET is sent; no prompts, model usage, or API credentials leave the browser.
+        const response = await fetch(PRICING_URL, { signal: controller.signal, credentials: 'omit', referrerPolicy: 'no-referrer' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const catalog = buildCatalog(await response.json());
+        if (!catalog.entries.length) throw new Error('Empty price catalog');
+        priceCatalog = catalog;
+        priceUpdatedAt = Date.now();
+        priceError = false;
+        try { localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify({ catalog, updatedAt: priceUpdatedAt })); } catch { /* Keep in-memory prices. */ }
+    } catch (error) {
+        priceError = true;
+        console.warn('[OmniTracker] models.dev price refresh failed:', error.message);
+    } finally {
+        clearTimeout(timeout);
+        priceLoading = false;
+        refreshPriceUI();
+    }
+}
+
+function refreshPriceUI() {
+    updateTopBarUI();
+    if (window.$ && $('#omni_tracker_modal').is(':visible')) {
+        const scrollTop = $('#omni_tab_content').scrollTop();
+        renderDashboardUI();
+        $('#omni_tab_content').scrollTop(scrollTop);
+    }
+}
 
 function getTodayDateString() {
     return new Date().toISOString().slice(0, 10);
@@ -190,6 +272,11 @@ function migrateLegacyActiveTime() {
     }
 }
 
+function recalculateTotalActiveMs() {
+    settings.activeTime.totalMs = Object.values(settings.activeTime.daily || {})
+        .reduce((total, ms) => total + (Number.isFinite(ms) && ms > 0 ? ms : 0), 0);
+}
+
 /**
  * 智能清洗与去水函数（老用户一键修复旧版误抓产生的虚高数据）
  * 100% 保留所有真实回复(Completion)、TTS语音、RPG活跃时长与成就
@@ -203,7 +290,7 @@ function cleanHistoricalWaterData(interactive = true) {
 
     // 1. 扫描并清除无任何输出的纯假模型（非 TTS）
     for (const [m, v] of Object.entries(bm)) {
-        if (m === 'Unknown' || 'tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+        if (m === 'Unknown' || m.toLowerCase().includes('tts') || m.toLowerCase().includes('mimo') || v.byCategory?.vectors) continue;
         const c = v.completion_tokens || 0;
         const p = v.prompt_tokens || 0;
 
@@ -216,7 +303,7 @@ function cleanHistoricalWaterData(interactive = true) {
 
     // 2. 校准被正则修剪严重注水的真实模型（输入输出比畸形 > 60:1）
     for (const [m, v] of Object.entries(bm)) {
-        if ('tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+        if (m.toLowerCase().includes('tts') || m.toLowerCase().includes('mimo') || v.byCategory?.vectors) continue;
         const c = v.completion_tokens || 0;
         const p = v.prompt_tokens || 0;
 
@@ -231,6 +318,8 @@ function cleanHistoricalWaterData(interactive = true) {
                     v.prompt_tokens = realisticPrompt;
                     v.total_tokens = realisticPrompt + c;
                     v.requests = Math.max(1, Math.round(c / 1500)); // 校准真实请求轮次
+                    delete v.cost_buckets; // Re-estimate calibrated history instead of retaining stale fees.
+                    for (const category of Object.values(v.byCategory || {})) delete category.cost_buckets;
 
                     if (v.byCategory && v.byCategory.chat) {
                         v.byCategory.chat.prompt_tokens = realisticPrompt;
@@ -244,7 +333,7 @@ function cleanHistoricalWaterData(interactive = true) {
 
     // 3. 清理 recentLogs 中的假记录
     const oldLogs = settings.recentLogs || [];
-    const cleanLogs = oldLogs.filter(r => (r.completion_tokens > 0 || r.category === 'tts'));
+    const cleanLogs = oldLogs.filter(r => (r.completion_tokens > 0 || r.category === 'tts' || r.category === 'vectors'));
     settings.recentLogs = cleanLogs;
 
     // 4. 重新聚合 totals
@@ -268,23 +357,26 @@ function cleanHistoricalWaterData(interactive = true) {
         settings.byCategory[catKey].completion_tokens = 0;
         settings.byCategory[catKey].total_tokens = 0;
         settings.byCategory[catKey].requests = 0;
+        delete settings.byCategory[catKey].cost_buckets;
     }
 
     for (const [m, v] of Object.entries(bm)) {
-        const isTTS = 'tts' in m.toLowerCase() || 'mimo' in m.toLowerCase();
-        const catKey = isTTS ? 'tts' : 'chat';
-        const target = settings.byCategory[catKey];
-        target.prompt_tokens += (v.prompt_tokens || 0);
-        target.completion_tokens += (v.completion_tokens || 0);
-        target.total_tokens += (v.total_tokens || 0);
-        target.requests += (v.requests || 0);
+        const isTTS = m.toLowerCase().includes('tts') || m.toLowerCase().includes('mimo');
+        const parts = Object.keys(v.byCategory || {}).length ? Object.entries(v.byCategory) : [[isTTS ? 'tts' : 'chat', v]];
+        for (const [category, usage] of parts) {
+            const target = settings.byCategory[category] || settings.byCategory.scripts;
+            for (const field of ['prompt_tokens', 'completion_tokens', 'total_tokens', 'requests']) target[field] += usage[field] || 0;
+            for (const bucket of Object.values(usage.cost_buckets || {})) addCostBucket(target, bucket);
+        }
     }
 
     // 校准 today（防止今日数据仍显示旧的虚高）
     if (settings.today) {
+        const previousTotal = settings.today.total_tokens;
         settings.today.prompt_tokens = Math.min(settings.today.prompt_tokens, settings.totals.prompt_tokens);
         settings.today.completion_tokens = Math.min(settings.today.completion_tokens, settings.totals.completion_tokens);
         settings.today.total_tokens = settings.today.prompt_tokens + settings.today.completion_tokens;
+        if (settings.today.total_tokens !== previousTotal) delete settings.today.cost_buckets;
     }
 
     safeSaveSettings();
@@ -405,12 +497,27 @@ function extractModelName(obj, url) {
 function applyUsageFrom(trackerItem, usageObj) {
     if (!usageObj || typeof usageObj !== 'object') return false;
 
-    const pIn = usageObj.prompt_tokens ?? usageObj.input_tokens ?? usageObj.promptTokenCount ?? usageObj.prompt_token_count;
-    const cOut = usageObj.completion_tokens ?? usageObj.output_tokens ?? usageObj.candidatesTokenCount ?? usageObj.candidates_token_count;
+    const pIn = usageObj.prompt_tokens ?? usageObj.input_tokens ?? usageObj.promptTokenCount ?? usageObj.prompt_token_count ?? usageObj.prompt_eval_count;
+    const cOut = usageObj.completion_tokens ?? usageObj.output_tokens ?? usageObj.candidatesTokenCount ?? usageObj.candidates_token_count ?? usageObj.eval_count;
 
     let hit = false;
-    if (typeof pIn === 'number' && pIn > 0) { trackerItem.prompt_tokens = pIn; hit = true; }
-    if (typeof cOut === 'number' && cOut > 0) { trackerItem.completion_tokens = cOut; hit = true; }
+    const cacheRead = usageObj.prompt_tokens_details?.cached_tokens ?? usageObj.input_tokens_details?.cached_tokens
+        ?? usageObj.cache_read_input_tokens ?? usageObj.cachedContentTokenCount;
+    const cacheWrite = usageObj.cache_creation_input_tokens;
+    if (typeof cacheRead === 'number') trackerItem.cached_tokens = Math.max(0, cacheRead);
+    if (typeof cacheWrite === 'number') trackerItem.cache_write_tokens = Math.max(0, cacheWrite);
+    if (typeof pIn === 'number' && pIn >= 0) {
+        // Anthropic excludes cached reads/writes from input_tokens; OpenAI/Gemini include them.
+        const extraCache = ('cache_read_input_tokens' in usageObj || 'cache_creation_input_tokens' in usageObj)
+            ? (trackerItem.cached_tokens || 0) + (trackerItem.cache_write_tokens || 0) : 0;
+        trackerItem.prompt_tokens = pIn + extraCache;
+        hit = true;
+    }
+    if (typeof cOut === 'number' && cOut >= 0) {
+        trackerItem.completion_tokens = cOut + (usageObj.thoughtsTokenCount || 0);
+        trackerItem.has_official_output = true;
+        hit = true;
+    }
     return hit;
 }
 
@@ -608,6 +715,11 @@ function recordApiUsage(item) {
     mCat.total_tokens += tTokens;
     mCat.requests += 1;
 
+    const pricing = makeCostBucket({ ...item, model: mName, prompt_tokens: pTokens, completion_tokens: cTokens }, priceCatalog);
+    for (const stats of [settings.totals, settings.today, settings.session, cat, mObj, mCat]) {
+        addCostBucket(stats, pricing);
+    }
+
     // 实时流水
     const logEntry = {
         id: Date.now() + Math.random().toString(36).substring(2, 6),
@@ -620,6 +732,8 @@ function recordApiUsage(item) {
         total_tokens: tTokens,
         duration_ms: item.duration_ms,
         is_stream: item.is_stream,
+        provider: item.provider || '',
+        pricing,
     };
 
     settings.recentLogs.unshift(logEntry);
@@ -649,7 +763,7 @@ function installFetchHook() {
         }
 
         let trackerItem = {
-            url: typeof url === 'string' ? url : (url.url || ''),
+            url: typeof url === 'string' ? url : (url instanceof URL ? url.href : (url.url || '')),
             model: 'Unknown',
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -685,6 +799,8 @@ function installFetchHook() {
                     }
                 } catch (_) {}
             }
+
+            trackerItem.provider = inferProvider(parsedReq || {}, trackerItem.url, priceCatalog);
 
             const stack = (new Error()).stack || '';
             const classification = classifyRequest(stack, trackerItem.url, parsedReq, trackerItem.is_stream, trackerItem.model);
@@ -735,15 +851,15 @@ function installFetchHook() {
                             }
 
                             // 2. 提取 usage 字段
-                            let hitUsage = false;
                             if (data && typeof data === 'object') {
-                                hitUsage = applyUsageFrom(trackerItem, data.usage)
+                                applyUsageFrom(trackerItem, data.usage)
                                     || applyUsageFrom(trackerItem, data.usageMetadata)
-                                    || applyUsageFrom(trackerItem, data.usage_metadata);
+                                    || applyUsageFrom(trackerItem, data.usage_metadata)
+                                    || applyUsageFrom(trackerItem, data);
                             }
 
                             // 3. 兜底提取输出文本算 Token
-                            if (!hitUsage) {
+                            if (!trackerItem.has_official_output) {
                                 const outText = extractOutputText(data);
                                 if (outText) trackerItem.completion_tokens = estimateTokens(outText);
                             }
@@ -766,7 +882,7 @@ function installFetchHook() {
         return response;
     };
 
-    console.log('[OmniTracker] 通用模型账本拦截器已就绪 (v1.5.0)');
+    console.log('[OmniTracker] 通用模型账本拦截器已就绪 (v1.6.0)');
 }
 
 async function consumeStreamForMetrics(stream, trackerItem, startTime) {
@@ -775,6 +891,25 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
     let buffer = '';
     let accumulatedText = '';
     let officialUsage = null;
+
+    const processLine = line => {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) return;
+        const dataStr = trimmed.slice(5).trim();
+        if (dataStr === '[DONE]') return;
+        try {
+            const parsed = JSON.parse(dataStr);
+            const model = parsed.model || parsed.message?.model;
+            if ((!trackerItem.model || trackerItem.model === 'Unknown') && typeof model === 'string') trackerItem.model = model;
+            // Anthropic sends input/cache counts at message_start and output counts at message_delta.
+            const usage = parsed.usage || parsed.message?.usage || parsed.usageMetadata || parsed.usage_metadata;
+            if (usage) officialUsage = { ...officialUsage, ...usage };
+            const chunk = parsed.choices?.[0]?.delta?.content || parsed.choices?.[0]?.text
+                || parsed.delta?.text || (typeof parsed.delta === 'string' ? parsed.delta : '')
+                || parsed.candidates?.[0]?.content?.parts?.map(part => part?.text || '').join('');
+            if (typeof chunk === 'string') accumulatedText += chunk;
+        } catch { /* Ignore keep-alives and unsupported stream frames. */ }
+    };
 
     try {
         while (true) {
@@ -785,46 +920,18 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
             const lines = buffer.split('\n');
             buffer = lines.pop();
 
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed.startsWith('data:')) continue;
-                const dataStr = trimmed.slice(5).trim();
-                if (dataStr === '[DONE]') continue;
-
-                try {
-                    const parsed = JSON.parse(dataStr);
-
-                    // 1. 从流式分片里补齐真实模型名（上游一手证据）
-                    if ((!trackerItem.model || trackerItem.model === 'Unknown') && typeof parsed.model === 'string' && parsed.model.trim()) {
-                        trackerItem.model = parsed.model.trim();
-                    }
-
-                    // 2. 合并流式 usage
-                    if (parsed.usage) officialUsage = parsed.usage;
-                    else if (parsed.usageMetadata) officialUsage = parsed.usageMetadata;
-                    else if (parsed.usage_metadata) officialUsage = parsed.usage_metadata;
-
-                    // 3. 拼接文本
-                    const chunk = parsed.choices?.[0]?.delta?.content
-                        || parsed.choices?.[0]?.text
-                        || parsed.delta
-                        || parsed.candidates?.[0]?.content?.parts?.[0]?.text
-                        || parsed.candidates?.[0]?.content?.parts?.map(p => p?.text || '').join('');
-                    if (typeof chunk === 'string' && chunk) {
-                        accumulatedText += chunk;
-                    }
-                } catch (_) {}
-            }
+            for (const line of lines) processLine(line);
         }
+        buffer += decoder.decode();
+        if (buffer.trim()) processLine(buffer);
     } catch (e) {
     } finally {
         trackerItem.duration_ms = Math.round(performance.now() - startTime);
 
-        let usageHit = false;
         if (officialUsage) {
-            usageHit = applyUsageFrom(trackerItem, officialUsage);
+            applyUsageFrom(trackerItem, officialUsage);
         }
-        if (!usageHit) {
+        if (!trackerItem.has_official_output) {
             trackerItem.completion_tokens = estimateTokens(accumulatedText);
         }
 
@@ -833,32 +940,107 @@ async function consumeStreamForMetrics(stream, trackerItem, startTime) {
 }
 
 // --- UI 挂载与渲染 ---
+let uiMountTimer;
+
+function positionFloatingIndicator(button, position = settings.floatingPosition) {
+    const viewport = window.visualViewport;
+    const left = (viewport?.offsetLeft || 0) + 8;
+    const top = (viewport?.offsetTop || 0) + 8;
+    const maxX = Math.max(left, left + (viewport?.width || window.innerWidth) - button.offsetWidth - 16);
+    const maxY = Math.max(top, top + (viewport?.height || window.innerHeight) - button.offsetHeight - 16);
+    const x = Number.isFinite(position?.x) ? position.x : maxX;
+    const y = Number.isFinite(position?.y) ? position.y : top + 60;
+    button.style.left = `${Math.min(maxX, Math.max(left, x))}px`;
+    button.style.top = `${Math.min(maxY, Math.max(top, y))}px`;
+}
+
+function enableFloatingDrag(button) {
+    let drag = null;
+    let suppressClick = false;
+    button.addEventListener('pointerdown', event => {
+        if (event.button !== 0 || event.isPrimary === false) return;
+        const rect = button.getBoundingClientRect();
+        drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, moved: false };
+        suppressClick = false;
+        button.setPointerCapture(event.pointerId);
+    });
+    button.addEventListener('pointermove', event => {
+        if (!drag || event.pointerId !== drag.id) return;
+        const dx = event.clientX - drag.x;
+        const dy = event.clientY - drag.y;
+        if (!drag.moved && Math.hypot(dx, dy) < 6) return;
+        drag.moved = true;
+        button.classList.add('omni-dragging');
+        positionFloatingIndicator(button, { x: drag.left + dx, y: drag.top + dy });
+    });
+    const finishDrag = event => {
+        if (!drag || event.pointerId !== drag.id) return;
+        const touchTap = !drag.moved && event.type === 'pointerup' && event.pointerType === 'touch';
+        suppressClick = (drag.moved || touchTap) && event.type === 'pointerup';
+        if (drag.moved) {
+            settings.floatingPosition = { x: parseFloat(button.style.left), y: parseFloat(button.style.top) };
+            safeSaveSettings();
+        }
+        drag = null;
+        button.classList.remove('omni-dragging');
+        if (button.hasPointerCapture(event.pointerId)) button.releasePointerCapture(event.pointerId);
+        // Some mobile browsers omit the synthetic click after a captured touch gesture.
+        if (touchTap) showDashboardModal();
+    };
+    button.addEventListener('pointerup', finishDrag);
+    button.addEventListener('pointercancel', finishDrag);
+    button.addEventListener('lostpointercapture', finishDrag);
+    button.addEventListener('click', event => {
+        if (suppressClick && event.detail !== 0) {
+            suppressClick = false;
+            event.preventDefault();
+            return;
+        }
+        showDashboardModal();
+    });
+}
+
+function resetFloatingPosition() {
+    settings.floatingPosition = null;
+    safeSaveSettings();
+    const button = document.getElementById('omni_tracker_topbar_btn');
+    if (button) positionFloatingIndicator(button);
+}
+
+function repositionFloatingIndicator() {
+    const button = document.getElementById('omni_tracker_topbar_btn');
+    if (button && !button.classList.contains('omni-dragging')) positionFloatingIndicator(button);
+}
+
+window.addEventListener('resize', repositionFloatingIndicator);
+window.visualViewport?.addEventListener('resize', repositionFloatingIndicator);
+window.visualViewport?.addEventListener('scroll', repositionFloatingIndicator);
+
 function tryMountUI() {
-    if (!window.$) {
-        setTimeout(tryMountUI, 300);
+    clearTimeout(uiMountTimer);
+    if (!window.$ || !document.body) {
+        uiMountTimer = setTimeout(tryMountUI, 300);
         return;
     }
 
     if (settings && settings.showInTopBar) {
         if ($('#omni_tracker_topbar_btn').length === 0) {
             const btnHtml = `
-                <div id="omni_tracker_topbar_btn" title="Omni API Tracker: 点击打开通用模型账本 (长按可隐藏)">
+                <button type="button" id="omni_tracker_topbar_btn" aria-label="打开 Omni 通用模型账本" title="Omni: 点击打开账本，拖动调整位置；USD 为估算费用">
                     <i class="fa-solid fa-bolt"></i>
                     <span id="omni_tracker_topbar_text">0</span>
-                </div>
+                </button>
             `;
 
-            if ($('#top-bar').length) {
-                $('#top-bar').append(btnHtml);
-            } else if ($('#chat_header').length) {
-                $('#chat_header').append(btnHtml);
-            }
-
-            $('#omni_tracker_topbar_btn').on('click', showDashboardModal);
+            // Mount independently: theme-specific top bars can be absent, clipped, or hidden.
+            $('body').append(btnHtml);
+            const button = document.getElementById('omni_tracker_topbar_btn');
+            enableFloatingDrag(button);
+            positionFloatingIndicator(button);
 
             $('#omni_tracker_topbar_btn').on('contextmenu', function (e) {
                 e.preventDefault();
-                if (confirm('是否隐藏顶栏快捷指示器？\n（可随时在右侧扩展列表中重新开启）')) {
+                if (confirm('是否隐藏悬浮快捷指示器？\n（可随时在扩展设置中重新开启）')) {
                     settings.showInTopBar = false;
                     safeSaveSettings();
                     $('#omni_tracker_topbar_btn').remove();
@@ -872,6 +1054,7 @@ function tryMountUI() {
 
     mountExtensionSettingsDrawer();
     updateTopBarUI();
+    if (!$('#omni_tracker_extension_settings').length) uiMountTimer = setTimeout(tryMountUI, 1000);
 }
 
 function mountExtensionSettingsDrawer() {
@@ -893,17 +1076,18 @@ function mountExtensionSettingsDrawer() {
                     </p>
 
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; padding:8px 10px; background:rgba(255,255,255,0.05); border-radius:6px;">
-                        <span style="font-size:12px; font-weight:700; color:#fff;">显示顶栏快捷指示器</span>
+                        <span style="font-size:12px; font-weight:700; color:#fff;">显示悬浮快捷指示器</span>
                         <label class="omni-switch">
                             <input type="checkbox" id="omni_drawer_toggle_topbar" ${settings?.showInTopBar ? 'checked' : ''}>
                             <span class="omni-slider"></span>
                         </label>
                     </div>
 
-                    <div style="display:flex; gap:10px;">
-                        <button class="menu_button" id="omni_open_dashboard_from_settings">
-                            <i class="fa-solid fa-chart-pie"></i> 打开通用模型账本
+                    <div class="omni-actions">
+                        <button type="button" class="menu_button omni-action-button" id="omni_open_dashboard_from_settings">
+                            <i class="fa-solid fa-chart-pie"></i><span>打开通用模型账本</span>
                         </button>
+                        <button type="button" class="menu_button omni-action-button" id="omni_drawer_reset_position">重置悬浮窗位置</button>
                     </div>
                 </div>
             </div>
@@ -911,6 +1095,7 @@ function mountExtensionSettingsDrawer() {
     `;
     $('#extensions_settings').append(drawerHtml);
     $('#omni_open_dashboard_from_settings').on('click', showDashboardModal);
+    $('#omni_drawer_reset_position').on('click', resetFloatingPosition);
 
     $('#omni_drawer_toggle_topbar').on('change', function () {
         const isChecked = $(this).prop('checked');
@@ -937,12 +1122,18 @@ function triggerTopBarPulse() {
 
 function updateTopBarUI() {
     if (!settings || !window.$) return;
+    if (settings.today.date !== getTodayDateString()) {
+        settings.today = { date: getTodayDateString(), prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, requests: 0 };
+        safeSaveSettings();
+    }
     const tokenStr = formatTokens(settings.today?.total_tokens || 0);
     const today = getTodayDateString();
     const todayMs = settings.activeTime?.daily?.[today] || 0;
     const timeStr = formatDuration(todayMs);
 
-    $('#omni_tracker_topbar_text').text(`${tokenStr} | ${timeStr}`);
+    const cost = formatCostSummary(summarizeCost(settings.today, priceCatalog), true);
+    $('#omni_tracker_topbar_text').text(`${tokenStr} | ${cost} | ${timeStr}`);
+    repositionFloatingIndicator();
 }
 
 function showDashboardModal() {
@@ -1014,6 +1205,7 @@ function renderDashboardUI(activeTab) {
 
             for (const m of mKeys) {
                 const data = models[m];
+                const modelCost = costText(data, m, Object.keys(data.byCategory || {}).length === 1 ? Object.keys(data.byCategory)[0] : '');
                 const modelTotal = Math.max(1, data.total_tokens || 0);
                 const shareOfAll = ((data.total_tokens || 0) / grandTotalTokens * 100).toFixed(1);
 
@@ -1034,12 +1226,13 @@ function renderDashboardUI(activeTab) {
 
                     segsHtml += `<div style="width:${Math.max(2, pct)}%; background:${meta.color};" title="${meta.label}: ${pct.toFixed(1)}%"></div>`;
                     rowsHtml += `
-                        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px; padding:6px 0; border-top:1px dashed #26263a;">
+                        <div class="omni-model-breakdown" style="display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:11px; padding:6px 0; border-top:1px dashed #26263a;">
                             <span style="color:#e2e8f0; flex:1; white-space:nowrap; display:flex; align-items:center; gap:6px;">
                                 <i class="fa-solid ${meta.icon}" style="color:${meta.color};"></i>
-                                <strong>${meta.label}</strong>
+                                <strong>${escapeHtml(meta.label)}</strong>
                             </span>
                             <span style="color:#94a3b8; white-space:nowrap;">${cv.requests}次 · 入 ${formatTokens(cv.prompt_tokens)} / 出 ${formatTokens(cv.completion_tokens)}</span>
+                            <span class="omni-cost" title="估算 USD">${costText(cv, m, ck)}</span>
                             <span style="color:#f8fafc; font-weight:700; white-space:nowrap; min-width:80px; text-align:right;">
                                 ${formatTokens(cv.total_tokens)} <span style="color:${meta.color}; font-size:10px;">${pct.toFixed(1)}%</span>
                             </span>
@@ -1051,10 +1244,11 @@ function renderDashboardUI(activeTab) {
                     <div class="omni-category-card" style="padding:12px 14px; margin-bottom:12px;">
                         <div style="display:flex; justify-content:space-between; align-items:baseline; margin-bottom:6px;">
                             <span style="font-weight:800; color:#38bdf8; font-size:14px; word-break:break-all;">
-                                <i class="fa-solid fa-microchip" style="margin-right:6px; color:#34d399;"></i>${m}
+                                <i class="fa-solid fa-microchip" style="margin-right:6px; color:#34d399;"></i>${escapeHtml(m)}
                             </span>
                             <span style="color:#34d399; font-weight:800; font-size:14px; white-space:nowrap;">${formatTokens(data.total_tokens)}</span>
                         </div>
+                        <div class="omni-model-cost">估算 USD：<strong>${modelCost}</strong></div>
                         <div style="display:flex; justify-content:space-between; font-size:11px; color:#94a3b8; margin-bottom:8px;">
                             <span>共调用 ${data.requests} 次 (入 ${formatTokens(data.prompt_tokens)} / 出 ${formatTokens(data.completion_tokens)})</span>
                             <span>占总用量 ${shareOfAll}%</span>
@@ -1076,6 +1270,7 @@ function renderDashboardUI(activeTab) {
                     <div class="omni-stat-title">今日总用量</div>
                     <div class="omni-stat-value">${formatTokens(today.total_tokens)}</div>
                     <div class="omni-stat-sub">${today.requests} 次交互 (入 ${formatTokens(today.prompt_tokens)} / 出 ${formatTokens(today.completion_tokens)})</div>
+                    <div class="omni-stat-sub omni-cost">估算 USD：${costText(today)}</div>
                 </div>
                 <div class="omni-stat-card">
                     <div class="omni-stat-title">今日活跃时长</div>
@@ -1086,8 +1281,11 @@ function renderDashboardUI(activeTab) {
                     <div class="omni-stat-title">历史累计消耗</div>
                     <div class="omni-stat-value" style="color:#c084fc !important;">${formatTokens(total.total_tokens)}</div>
                     <div class="omni-stat-sub">总计 ${total.requests} 次调用</div>
+                    <div class="omni-stat-sub omni-cost">估算 USD：${formatCostSummary(historicalCost())}</div>
                 </div>
             </div>
+
+            <div class="omni-pricing-note">${escapeHtml(pricingStatusText())}<br>USD 按 models.dev 估算，未知中转使用原厂参考价；旧记录按当前价回估。未计价调用不包含在合计中，实际账单以服务商为准。</div>
 
             <div class="omni-section-title">
                 <i class="fa-solid fa-cubes-stacked" style="color:#38bdf8;"></i> 模型用量明细 (按模型归集，清晰展示主聊与预设比例)
@@ -1213,21 +1411,26 @@ function renderDashboardUI(activeTab) {
         let rowsHtml = '';
         for (const log of logs) {
             const catMeta = CATEGORY_MAP[log.category] || { label: log.category, color: '#8b5cf6' };
+            const estimate = estimateBucket(log.pricing || { ...log, requests: 1 }, priceCatalog);
+            const priceDetail = estimate.usd === null ? estimate.reason
+                : `${estimate.provider}${estimate.reference ? ' 原厂参考价' : ''} · 输入 ${formatUsd(estimate.inputUsd)} / 输出 ${formatUsd(estimate.outputUsd)} · USD/百万 Token 入 ${estimate.rates.input ?? '-'} / 出 ${estimate.rates.output ?? '-'}`;
             rowsHtml += `
                 <tr>
-                    <td style="color:#94a3b8;">${log.time}</td>
-                    <td><span class="omni-badge omni-badge-${log.category || 'scripts'}">${catMeta.label}</span></td>
-                    <td style="color:#f8fafc; font-weight:600; max-width:130px; overflow:hidden; text-overflow:ellipsis;">${log.caller || '-'}</td>
-                    <td style="color:#38bdf8; max-width:150px; overflow:hidden; text-overflow:ellipsis;" title="${log.model}">${log.model || '-'}</td>
+                    <td style="color:#94a3b8;">${escapeHtml(log.time)}</td>
+                    <td><span class="omni-badge omni-badge-${CATEGORY_MAP[log.category] ? log.category : 'scripts'}">${escapeHtml(catMeta.label)}</span></td>
+                    <td style="color:#f8fafc; font-weight:600; max-width:130px; overflow:hidden; text-overflow:ellipsis;">${escapeHtml(log.caller || '-')}</td>
+                    <td style="color:#38bdf8; max-width:150px; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(log.model)}">${escapeHtml(log.model || '-')}</td>
                     <td>${formatTokens(log.prompt_tokens)}</td>
                     <td>${formatTokens(log.completion_tokens)}</td>
                     <td style="font-weight:700; color:#34d399;">${formatTokens(log.total_tokens)}</td>
+                    <td class="omni-cost" title="${escapeHtml(priceDetail)}">${formatUsd(estimate.usd)}${estimate.reference ? ' ≈' : ''}</td>
                     <td style="color:#94a3b8;">${log.duration_ms ? log.duration_ms + 'ms' : '-'}</td>
                 </tr>
             `;
         }
 
         $panel.html(`
+            <div class="omni-pricing-note">估算 USD · 悬停金额可查看输入/输出费用和单价；≈ 为原厂参考价。旧记录按当前价格回估。${escapeHtml(pricingStatusText())}</div>
             <div class="omni-table-wrap">
                 <table class="omni-log-table">
                     <thead>
@@ -1239,6 +1442,7 @@ function renderDashboardUI(activeTab) {
                             <th>Prompt</th>
                             <th>Completion</th>
                             <th>Total</th>
+                            <th>估算 USD</th>
                             <th>耗时</th>
                         </tr>
                     </thead>
@@ -1253,8 +1457,8 @@ function renderDashboardUI(activeTab) {
             <div style="font-size: 13px; line-height: 1.8;">
                 <div class="omni-setting-row">
                     <div>
-                        <div class="omni-setting-label">显示顶栏快捷指示器</div>
-                        <div class="omni-setting-desc">在酒馆顶栏显示 ⚡ 今日消耗与活跃时长（关闭后界面更清爽，可随时在扩展列表中打开看板）</div>
+                        <div class="omni-setting-label">显示悬浮快捷指示器</div>
+                        <div class="omni-setting-desc">显示 ⚡ 今日 Token | 估算 USD | 活跃时长。拖动调整位置，点击打开账本。</div>
                     </div>
                     <label class="omni-switch">
                         <input type="checkbox" id="omni_modal_toggle_topbar" ${settings.showInTopBar ? 'checked' : ''}>
@@ -1262,7 +1466,11 @@ function renderDashboardUI(activeTab) {
                     </label>
                 </div>
 
+                <div class="omni-pricing-note">${escapeHtml(pricingStatusText())}<br>价格缓存 24 小时；新调用保留已匹配的单价。无法匹配的模型、语音和非 Token 计费项目显示“未计价”，不视为免费。</div>
+
                 <div class="omni-actions" style="margin-top:20px;">
+                    <button type="button" class="menu_button" id="omni_btn_refresh_prices" ${priceLoading ? 'disabled' : ''}>${priceLoading ? '正在更新价格…' : '刷新 models.dev 价格'}</button>
+                    <button type="button" class="menu_button" id="omni_btn_reset_position">重置悬浮窗位置</button>
                     <button class="menu_button" id="omni_btn_reset_session"><i class="fa-solid fa-arrows-rotate"></i> 重置本次会话</button>
                     <button class="menu_button" id="omni_btn_reset_today"><i class="fa-solid fa-calendar-xmark"></i> 清空今日统计</button>
                     <button class="menu_button" id="omni_btn_clean_water" style="background:#065f46 !important; color:#6ee7b7 !important;"><i class="fa-solid fa-broom"></i> 智能去水清洗 (修复旧版虚高)</button>
@@ -1274,6 +1482,9 @@ function renderDashboardUI(activeTab) {
             </div>
         `);
 
+        $('#omni_btn_refresh_prices').on('click', () => loadPrices(true));
+        $('#omni_btn_reset_position').on('click', resetFloatingPosition);
+
         $('#omni_modal_toggle_topbar').on('change', function () {
             const isChecked = $(this).prop('checked');
             settings.showInTopBar = isChecked;
@@ -1282,10 +1493,10 @@ function renderDashboardUI(activeTab) {
 
             if (isChecked) {
                 tryMountUI();
-                if (window.toastr) toastr.success('已开启顶栏指示器');
+                if (window.toastr) toastr.success('已开启悬浮指示器');
             } else {
                 $('#omni_tracker_topbar_btn').remove();
-                if (window.toastr) toastr.info('已隐藏顶栏指示器（可随时从右侧扩展设置中重新打开）');
+                if (window.toastr) toastr.info('已隐藏悬浮指示器（可随时从扩展设置中重新打开）');
             }
         });
 
@@ -1309,7 +1520,7 @@ function renderDashboardUI(activeTab) {
             let estimatedWater = 0;
             const bm = settings.byModel || {};
             for (const [m, v] of Object.entries(bm)) {
-                if ('tts' in m.toLowerCase() || 'mimo' in m.toLowerCase()) continue;
+                if (m.toLowerCase().includes('tts') || m.toLowerCase().includes('mimo') || v.byCategory?.vectors) continue;
                 const c = v.completion_tokens || 0;
                 const p = v.prompt_tokens || 0;
                 if (c === 0 && p > 0) estimatedWater += p;
@@ -1361,10 +1572,12 @@ function renderDashboardUI(activeTab) {
                             if (window.toastr) toastr.success('成功合并历史活跃时长数据！');
                         } else if (data.totals || data.activeTime) {
                             Object.assign(settings, data);
+                            loadSettings();
                             recalculateTotalActiveMs();
                             if (window.toastr) toastr.success('成功恢复 OmniTracker 完整数据！');
                         }
                         safeSaveSettings();
+                        tryMountUI();
                         renderDashboardUI('settings');
                         updateTopBarUI();
                     }
@@ -1383,6 +1596,7 @@ function renderDashboardUI(activeTab) {
                 settings = extension_settings[EXTENSION_NAME];
                 localStorage.removeItem(LEGACY_USAGE_KEY);
                 safeSaveSettings();
+                tryMountUI();
                 renderDashboardUI('settings');
                 updateTopBarUI();
                 if (window.toastr) toastr.success('所有统计与时长数据已清空');
@@ -1395,6 +1609,8 @@ function renderDashboardUI(activeTab) {
 (function () {
     loadSettings();
     installFetchHook();
+    void loadPrices();
+    if (event_types.APP_READY) eventSource.on(event_types.APP_READY, tryMountUI);
 
     if (document.readyState === 'complete' || document.readyState === 'interactive') {
         setTimeout(tryMountUI, 100);
